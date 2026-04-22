@@ -1,0 +1,22 @@
+# API-Schlüssel und sensible Daten
+.env
+
+# Virtuelle Python-Umgebungen und Bibliotheksdateien
+venv/
+.venv/
+env/
+
+# Python-Cache und kompilierte Dateien
+__pycache__/
+*.py[cod]
+*$py.class
+
+# IDE- und Systemdateien
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Lokale Datenbanken oder Logdateien für RAG
+*.log
+data/processed/
