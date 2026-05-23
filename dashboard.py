@@ -1,24 +1,19 @@
 import subprocess
 import sys
+import io
+import os
 
-# Liste der benötigten Pakete (Pip-Installationsnamen)
-required_packages = [
-    "dash", "dash-bootstrap-components", "plotly", "pandas", 
-    "numpy", "yfinance", "groq", "python-dotenv"
-]
+# Fix Windows encoding issues for UTF-8 characters
+os.environ['PYTHONIOENCODING'] = 'utf-8'
+if sys.stdout.encoding != 'utf-8':
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+if sys.stderr.encoding != 'utf-8':
+    sys.stderr.reconfigure(encoding='utf-8', errors='replace')
 
-def install_and_import(packages):
-    # Überprüft jedes Paket und installiert es, falls es nicht vorhanden ist
-    for package in packages:
-        try:
-            # Import-Namen können sich von Paket-Namen unterscheiden
-            import_name = "dotenv" if package == "python-dotenv" else package.replace("-", "_")
-            __import__(import_name)
-        except ImportError:
-            subprocess.check_call([sys.executable, "-m", "pip", "install", package])
+# All packages should be pre-installed via venv
+# No auto-installation to avoid package conflicts
 
-# Automatische Installation ausführen
-install_and_import(required_packages)
+
 import dash
 from dash import dcc, html, Input, Output, State, callback_context
 import dash_bootstrap_components as dbc
@@ -35,9 +30,41 @@ import traceback
 from dotenv import load_dotenv
 import base64
 import io
+import logging
+
+# RAG imports
+try:
+    from rag.pipeline import RAGPipeline
+    RAG_AVAILABLE = True
+except Exception as e:
+    print(f"Warning: RAG modules not available: {e}")
+    RAG_AVAILABLE = False
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # Load environment variables
 load_dotenv()
+
+# Initialize RAG Pipeline in background thread
+rag_pipeline = None
+
+def _init_rag_background():
+    global rag_pipeline, RAG_AVAILABLE
+    if not RAG_AVAILABLE:
+        return
+    try:
+        persist_dir = os.path.join(os.getcwd(), "data", "faiss")
+        rag_pipeline = RAGPipeline(persist_dir=persist_dir)
+        logger.info("RAG Pipeline initialized successfully")
+    except Exception as e:
+        logger.warning(f"Failed to initialize RAG pipeline: {e}")
+        RAG_AVAILABLE = False
+
+if RAG_AVAILABLE:
+    import threading
+    threading.Thread(target=_init_rag_background, daemon=True).start()
 
 
 # Initialize Dash app
@@ -672,10 +699,101 @@ app.layout = html.Div([
                         ], className="mt-4"),
                     ])
                 ]),
+
+                # RAG News Analysis Tab
+                dbc.Tab(label="Nachrichten & RAG", tab_id="tab-rag", children=[
+                    html.Div([
+                        dbc.Row([
+                            dbc.Col([
+                                dbc.Card([
+                                    dbc.CardHeader("Yahoo Finance Nachrichten - RAG", className="card-header-custom"),
+                                    dbc.CardBody([
+                                        html.P("Holen Sie sich die neuesten Nachrichten von Yahoo Finance und stellen Sie Fragen mit RAG-gestützter Kontextanalyse.",
+                                               className="text-muted mb-3"),
+                                        
+                                        # News Fetching Section
+                                        html.Div([
+                                            html.H5("1. Nachrichten indizieren", style={'fontSize': '1.1rem', 'fontWeight': '600'}),
+                                            dbc.Row([
+                                                dbc.Col([
+                                                    dbc.Label("Ticker (komma-getrennt, z.B. AAPL,MSFT,TSLA)", style={'fontWeight': '500'}),
+                                                    dbc.Input(id="rag-ticker-input", 
+                                                             placeholder="z.B. AAPL,MSFT,TSLA",
+                                                             type="text",
+                                                             value="AAPL,MSFT,TSLA",
+                                                             style={'borderRadius': '4px', 'marginBottom': '10px'})
+                                                ], width=8),
+                                                dbc.Col([
+                                                    dbc.Label("Pro Ticker: "),
+                                                    dbc.Input(id="rag-limit-input", 
+                                                             placeholder="5",
+                                                             type="number",
+                                                             value=5,
+                                                             min=1,
+                                                             max=20,
+                                                             style={'borderRadius': '4px'})
+                                                ], width=4)
+                                            ]),
+                                            dbc.Button("Nachrichten abrufen & indizieren", 
+                                                      id="btn-rag-fetch",
+                                                      color="primary", 
+                                                      className="btn-custom mb-3",
+                                                      size="md",
+                                                      style={'marginTop': '10px'}),
+                                            html.Div(id="rag-fetch-status", className="mb-3"),
+                                        ], className="mb-4", style={'padding': '15px', 'border': '1px solid #30363d', 'borderRadius': '4px'}),
+
+                                        # RAG Query Section
+                                        html.Div([
+                                            html.H5("2. Nachrichten durchsuchen & Fragen beantworten", style={'fontSize': '1.1rem', 'fontWeight': '600'}),
+                                            dbc.Row([
+                                                dbc.Col([
+                                                    dbc.Label("Frage eingeben:", style={'fontWeight': '500'}),
+                                                    dbc.Input(id="rag-query-input",
+                                                             placeholder="z.B. Was sind die neuesten Nachrichten über Apple?",
+                                                             type="text",
+                                                             style={'borderRadius': '4px', 'marginBottom': '10px'})
+                                                ], width=8),
+                                                dbc.Col([
+                                                    dbc.Label("Top-K Ergebnisse: "),
+                                                    dbc.Input(id="rag-topk-input",
+                                                             placeholder="5",
+                                                             type="number",
+                                                             value=5,
+                                                             min=1,
+                                                             max=20,
+                                                             style={'borderRadius': '4px'})
+                                                ], width=4)
+                                            ]),
+                                            dbc.Button("Mit RAG abfragen",
+                                                      id="btn-rag-query",
+                                                      color="success",
+                                                      className="btn-custom mb-3",
+                                                      size="md",
+                                                      style={'marginTop': '10px'}),
+                                            html.Div(id="rag-query-status", className="mb-3"),
+                                        ], className="mb-3", style={'padding': '15px', 'border': '1px solid #30363d', 'borderRadius': '4px'}),
+
+                                        # Results Section
+                                        html.Div([
+                                            html.H5("RAG Ergebnisse", style={'fontSize': '1.1rem', 'fontWeight': '600', 'marginTop': '20px'}),
+                                            dcc.Loading(
+                                                id="loading-rag",
+                                                type="default",
+                                                children=html.Div(id="rag-results-output", style={'whiteSpace': 'pre-wrap', 'minHeight': '100px'})
+                                            )
+                                        ], style={'marginTop': '20px'})
+                                    ])
+                                ], className="card-custom")
+                            ])
+                        ], className="mt-4"),
+                    ])
+                ]),
             ], id="tabs", active_tab="tab-overview"),
 
             dcc.Store(id='portfolio-store', data={'positions': []}),
             dcc.Store(id='analysis-data', data={}),
+            dcc.Store(id='rag-status', data={'indexed_tickers': [], 'doc_count': 0}),
 
         ], fluid=True, className="main-container")
     ])
@@ -958,13 +1076,14 @@ def manage_portfolio(add_clicks, clear_clicks, sell_clicks, csv_contents,
                 })
 
             return {'positions': positions}, dbc.Alert(
-                f" {len(positions)} Positionen aus '{csv_filename}' geladen",
+                f"✓ {len(positions)} Positionen aus '{csv_filename}' geladen",
                 color="success", duration=3000
             ), ""
 
         except Exception as e:
+            error_msg = str(e).encode('utf-8', errors='replace').decode('utf-8', errors='replace')
             return stored_data, "", dbc.Alert(
-                f"Fehler beim CSV-Import: {str(e)}",
+                f"Fehler beim CSV-Import: {error_msg}",
                 color="danger", duration=4000
             )
 
@@ -1471,14 +1590,14 @@ def update_dashboard(stored_data):
                 spy_total_return = (spy_hist['Close'].iloc[-1] / spy_hist['Close'].iloc[0] - 1) * 100
                 spy_volatility = spy_returns.std() * np.sqrt(252) * 100
 
-                portfolio_vs_spy = total_pnl_pct - spy_total_return
+                portfolio_vs_spy = total_return - spy_total_return
 
                 benchmark_metrics = dbc.Row([
                     dbc.Col([
                         dbc.Card([
                             dbc.CardBody([
-                                html.H5("Portfolio Return", className="text-muted"),
-                                html.H3(f"{total_pnl_pct:.2f}%", style={'color': '#f0f6fc', 'fontWeight': '700'}),
+                                html.H5("Portfolio Return (TWR)", className="text-muted"),
+                                html.H3(f"{total_return:.2f}%", style={'color': '#f0f6fc', 'fontWeight': '700'}),
                             ])
                         ], className="card-custom")
                     ], width=3),
@@ -1700,6 +1819,190 @@ Halte die Antwort auf 8-10 Sätze. Sei konkret und direkt. Bearbeite die Fragen 
             ])
         ], color="danger")
     
+
+# RAG Callbacks
+
+# Callback: Fetch and Index News
+@app.callback(
+    [Output('rag-fetch-status', 'children'),
+     Output('rag-status', 'data')],
+    [Input('btn-rag-fetch', 'n_clicks')],
+    [State('rag-ticker-input', 'value'),
+     State('rag-limit-input', 'value')],
+    prevent_initial_call=True
+)
+def fetch_and_index_news(n_clicks, tickers_str, limit):
+    if not n_clicks or not rag_pipeline:
+        return dbc.Alert("RAG Pipeline nicht verfügbar", color="warning"), {}
+
+    if not tickers_str:
+        return dbc.Alert("Bitte Ticker eingeben (komma-getrennt)", color="warning"), {}
+
+    try:
+        # Parse tickers
+        tickers = [t.strip().upper() for t in tickers_str.split(',')]
+        limit = int(limit) if limit else 5
+
+        logger.info(f"Starting news indexing for tickers: {tickers}, limit: {limit}")
+
+        # Index news
+        stats = rag_pipeline.index_news_for_tickers(tickers, news_limit=limit)
+
+        # Get vectorstore stats
+        db_stats = rag_pipeline.get_stats()
+
+        status_msg = dbc.Alert([
+            html.H5("✅ Nachrichten erfolgreich indiziert!", className="mb-2"),
+            dbc.Row([
+                dbc.Col([
+                    html.P(f"Ticker verarbeitet: {stats['tickers_successful']} / {stats['tickers_processed']}")
+                ], width=6),
+                dbc.Col([
+                    html.P(f"Artikel: {stats['total_articles']}")
+                ], width=6)
+            ]),
+            dbc.Row([
+                dbc.Col([
+                    html.P(f"Chunks erstellt: {stats['total_chunks']}")
+                ], width=6),
+                dbc.Col([
+                    html.P(f"Gesamt indexiert: {db_stats['indexed_documents']} Dokumente")
+                ], width=6)
+            ]),
+            html.Hr(),
+            html.Small(f"Zeitstempel: {stats['timestamp']}")
+        ], color="success", className="mb-3")
+
+        rag_status_data = {
+            'indexed_tickers': tickers,
+            'doc_count': db_stats['indexed_documents'],
+            'last_index_time': stats['timestamp']
+        }
+
+        return status_msg, rag_status_data
+
+    except Exception as e:
+        logger.error(f"Error indexing news: {e}")
+        return dbc.Alert([
+            html.H5("❌ Fehler beim Indizieren", color="danger"),
+            html.P(f"Fehler: {str(e)}")
+        ], color="danger"), {}
+
+
+# Callback: RAG Query
+@app.callback(
+    Output('rag-results-output', 'children'),
+    [Input('btn-rag-query', 'n_clicks')],
+    [State('rag-query-input', 'value'),
+     State('rag-topk-input', 'value'),
+     State('rag-status', 'data')],
+    prevent_initial_call=True
+)
+def query_with_rag(n_clicks, query, topk, rag_status):
+    if not n_clicks or not rag_pipeline:
+        return dbc.Alert("RAG Pipeline nicht verfügbar oder nicht initialisiert", color="warning")
+
+    if not query:
+        return dbc.Alert("Bitte eine Frage eingeben", color="warning")
+
+    if rag_status.get('doc_count', 0) == 0:
+        return dbc.Alert("Keine Nachrichten indexiert. Bitte zuerst Nachrichten abrufen.", color="info")
+
+    try:
+        topk = int(topk) if topk else 5
+        logger.info(f"RAG query: '{query[:60]}...', top_k: {topk}")
+
+        # Retrieve context
+        retrieved = rag_pipeline.retrieve_context(query, top_k=topk)
+
+        if not retrieved:
+            return dbc.Alert("Keine relevanten Nachrichten gefunden", color="info")
+
+        # Format context for LLM
+        context = rag_pipeline.format_context_for_llm(retrieved, max_tokens=2000)
+
+        # Create Groq prompt with RAG context
+        prompt = f"""Du bist ein Finanzanalyst. Beantworte die folgende Frage basierend auf den gegebenen Nachrichten-Kontext.
+
+KONTEXT (Nachrichten):
+{context}
+
+FRAGE: {query}
+
+Bitte:
+1. Beantworte die Frage basierend auf den gegebenen Nachrichten
+2. Zitiere die Quellen (Links) wo relevant
+3. Markiere besonders wichtige Punkte
+4. Halte die Antwort prägnant (max 500 Wörter)"""
+
+        # Call Groq API
+        try:
+            client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
+            response = client.chat.completions.create(
+                messages=[{"role": "user", "content": prompt}],
+                model="llama-3.3-70b-versatile",
+                max_tokens=2048,
+            )
+            llm_response = response.choices[0].message.content
+        except Exception as e:
+            logger.warning(f"Groq API error: {e}, using context summary instead")
+            llm_response = f"Groq API nicht verfügbar. Hier sind die gefundenen Nachrichten:\n\n{context}"
+
+        # Build result output
+        result_components = [
+            html.H5("🤖 RAG-gestützte Antwort", style={'color': '#58a6ff', 'marginTop': '20px', 'marginBottom': '10px'}),
+            html.Div(llm_response, style={
+                'whiteSpace': 'pre-wrap',
+                'lineHeight': '1.6',
+                'fontSize': '0.95rem',
+                'color': '#f0f6fc',
+                'marginBottom': '20px',
+                'padding': '15px',
+                'backgroundColor': '#0d1117',
+                'borderLeft': '3px solid #58a6ff',
+                'borderRadius': '4px'
+            }),
+            html.Hr(),
+            html.H5("📰 Quelle (Top-K Nachrichten)", style={'color': '#79c0ff', 'marginBottom': '10px'}),
+        ]
+
+        # Add source cards
+        for i, chunk in enumerate(retrieved, 1):
+            metadata = chunk.get('metadata', {})
+            title = metadata.get('title', 'N/A')
+            ticker = metadata.get('ticker', 'N/A')
+            link = metadata.get('link', '#')
+            source = metadata.get('source', 'Unknown')
+            text = chunk.get('text', '')
+
+            result_components.append(
+                dbc.Card([
+                    dbc.CardBody([
+                        dbc.Row([
+                            dbc.Col([
+                                html.H6(f"[{i}] {ticker} - {title[:60]}", style={'color': '#58a6ff'}),
+                            ], width=9),
+                            dbc.Col([
+                                html.Small(source, className="text-muted")
+                            ], width=3)
+                        ]),
+                        html.P(text[:200] + "...", className="text-muted small", style={'marginTop': '10px', 'marginBottom': '10px'}),
+                        html.A("📌 Link zur Nachricht", href=link, target="_blank", className="small",
+                               style={'color': '#79c0ff', 'textDecoration': 'underline'})
+                    ])
+                ], className="card-custom", style={'marginBottom': '10px'})
+            )
+
+        return html.Div(result_components)
+
+    except Exception as e:
+        logger.error(f"Error in RAG query: {e}")
+        import traceback
+        traceback.print_exc()
+        return dbc.Alert([
+            html.H5("❌ Fehler bei RAG-Abfrage"),
+            html.P(f"Fehler: {str(e)}")
+        ], color="danger")
 
 
 if __name__ == '__main__':

@@ -20,3 +20,8 @@ Thumbs.db
 # Lokale Datenbanken oder Logdateien für RAG
 *.log
 data/processed/
+data/faiss/
+data/chroma/
+
+# Claude Code interne Einstellungen
+.claude/
