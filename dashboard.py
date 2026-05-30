@@ -794,6 +794,7 @@ app.layout = html.Div([
             dcc.Store(id='portfolio-store', data={'positions': []}),
             dcc.Store(id='analysis-data', data={}),
             dcc.Store(id='rag-status', data={'indexed_tickers': [], 'doc_count': 0}),
+            dcc.Interval(id='auto-load-trigger', interval=500, max_intervals=1),
 
         ], fluid=True, className="main-container")
     ])
@@ -1770,8 +1771,8 @@ Bitte bewerte diese Metriken kurz und prägnant:
 5. Ist das Portfolio gut diversifiziert? (Korrelations-Analyse)
 6. Gibt es klare Warnsignale oder Stärken?
 
-Halte die Antwort auf 8-10 Sätze. Sei konkret und direkt. Bearbeite die Fragen nacheinander"""
-
+"""
+# Halte die Antwort auf 8-10 Sätze. Sei konkret und direkt. Bearbeite die Fragen nacheinander
         # Call Groq API
 
         response = client.chat.completions.create(
@@ -2004,6 +2005,9 @@ Bitte:
             html.P(f"Fehler: {str(e)}")
         ], color="danger")
 
+
+import auto_load
+auto_load.register(app, fetch_price_at_date)
 
 if __name__ == '__main__':
     app.run(debug=True, port=8050)
