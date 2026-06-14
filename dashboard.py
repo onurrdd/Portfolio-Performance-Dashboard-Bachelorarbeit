@@ -41,8 +41,9 @@ def _init_rag_background():
         logger.warning(f"Failed to initialize RAG pipeline: {e}")
         RAG_AVAILABLE = False
 
-if RAG_AVAILABLE:
-    threading.Thread(target=_init_rag_background, daemon=True).start()
+# RAG deaktiviert — bei Bedarf wieder einkommentieren
+# if RAG_AVAILABLE:
+#     threading.Thread(target=_init_rag_background, daemon=True).start()
 
 # --- App ---
 app = dash.Dash(__name__, external_stylesheets=[dbc.themes.BOOTSTRAP])
@@ -219,6 +220,32 @@ app.layout = html.Div([
                                         dbc.Button("Portfolio analysieren", id="btn-analyze", color="primary", className="btn-custom mb-3", size="lg"),
                                         dcc.Loading(id="loading-ai", type="default",
                                                    children=html.Div(id="ai-analysis-output", style={'whiteSpace': 'pre-wrap'}))
+                                    ])
+                                ], className="card-custom")
+                            ])
+                        ], className="mt-4"),
+                    ])
+                ]),
+
+                dbc.Tab(label="Naive LLM", tab_id="tab-naive-llm", children=[
+                    html.Div([
+                        dbc.Row([
+                            dbc.Col([
+                                dbc.Card([
+                                    dbc.CardHeader("Naive LLM", className="card-header-custom"),
+                                    dbc.CardBody([
+                                        dbc.Button(
+                                            "Performance Attribution Analyse",
+                                            id="btn-naive-llm-attribution",
+                                            color="success",
+                                            className="btn-custom",
+                                            size="lg",
+                                        ),
+                                        dcc.Loading(
+                                            id="loading-naive-llm",
+                                            type="default",
+                                            children=html.Div(id="naive-llm-output", style={'whiteSpace': 'pre-wrap'})
+                                        )
                                     ])
                                 ], className="card-custom")
                             ])
