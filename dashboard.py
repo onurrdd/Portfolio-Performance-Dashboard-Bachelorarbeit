@@ -16,34 +16,40 @@ import dash
 import dash_bootstrap_components as dbc
 from dash import dcc, html
 
-# RAG
-try:
-    from rag.pipeline import RAGPipeline
-    RAG_AVAILABLE = True
-except Exception as e:
-    print(f"Warning: RAG modules not available: {e}")
-    RAG_AVAILABLE = False
+# RAG deaktiviert — bei Bedarf wieder einkommentieren
+# try:
+#     from rag.pipeline import RAGPipeline
+#     RAG_AVAILABLE = True
+# except Exception as e:
+#     print(f"Warning: RAG modules not available: {e}")
+#     RAG_AVAILABLE = False
+RAG_AVAILABLE = False
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 load_dotenv()
 
-# --- RAG init (background) ---
+# --- RAG init (deaktiviert) ---
 rag_pipeline = None
 
-def _init_rag_background():
-    global rag_pipeline, RAG_AVAILABLE
-    try:
-        persist_dir = os.path.join(os.getcwd(), "data", "faiss")
-        rag_pipeline = RAGPipeline(persist_dir=persist_dir)
-        logger.info("RAG Pipeline initialized successfully")
-    except Exception as e:
-        logger.warning(f"Failed to initialize RAG pipeline: {e}")
-        RAG_AVAILABLE = False
-
-# RAG deaktiviert — bei Bedarf wieder einkommentieren
+# Bei Bedarf wieder einkommentieren:
+# def _init_rag_background():
+#     global rag_pipeline, RAG_AVAILABLE
+#     try:
+#         persist_dir = os.path.join(os.getcwd(), "data", "faiss")
+#         rag_pipeline = RAGPipeline(persist_dir=persist_dir)
+#         logger.info("RAG Pipeline initialized successfully")
+#     except Exception as e:
+#         logger.warning(f"Failed to initialize RAG pipeline: {e}")
+#         RAG_AVAILABLE = False
+#
 # if RAG_AVAILABLE:
 #     threading.Thread(target=_init_rag_background, daemon=True).start()
+
+import auto_load
+from utils.finance import fetch_price_at_date
+
+_initial_positions = auto_load.load_initial_positions(fetch_price_at_date)
 
 # --- App ---
 app = dash.Dash(__name__, external_stylesheets=[dbc.themes.BOOTSTRAP])
@@ -82,10 +88,11 @@ app.index_string = '''
             .btn-danger:hover { background: #da3633; border: 1px solid #da3633; color: white; }
             h1 { color: #f0f6fc; font-weight: 700; margin-bottom: 8px; letter-spacing: -0.5px; }
             .text-muted { color: #8b949e !important; }
-            .nav-tabs { border-bottom: 2px solid #30363d; }
+            .nav-tabs { border-bottom: 2px solid #30363d; display: flex; }
             .nav-tabs .nav-link { border-radius: 0; font-weight: 500; color: #8b949e; border: none; border-bottom: 2px solid transparent; padding: 12px 24px; font-size: 0.9rem; }
             .nav-tabs .nav-link.active { background: transparent; color: #f0f6fc; border-bottom: 2px solid #58a6ff; }
             .nav-tabs .nav-link:hover { color: #f0f6fc; border-bottom: 2px solid #8b949e; }
+            .nav-tabs .nav-item:nth-last-child(2) { margin-left: auto; }
             .table { color: #c9d1d9; }
             .table-striped tbody tr:nth-of-type(odd) { background-color: rgba(110, 118, 129, 0.05); }
             .table-bordered { border-color: #30363d; }
@@ -232,20 +239,12 @@ app.layout = html.Div([
                         dbc.Row([
                             dbc.Col([
                                 dbc.Card([
-                                    dbc.CardHeader("Naive LLM", className="card-header-custom"),
+                                    dbc.CardHeader("AI-gestützte Portfolio-Analyse", className="card-header-custom"),
                                     dbc.CardBody([
-                                        dbc.Button(
-                                            "Performance Attribution Analyse",
-                                            id="btn-naive-llm-attribution",
-                                            color="success",
-                                            className="btn-custom",
-                                            size="lg",
-                                        ),
-                                        dcc.Loading(
-                                            id="loading-naive-llm",
-                                            type="default",
-                                            children=html.Div(id="naive-llm-output", style={'whiteSpace': 'pre-wrap'})
-                                        )
+                                        html.P("Lass die AI dein Portfolio analysieren und Risikobewertungen erstellen.", className="text-muted mb-3"),
+                                        dbc.Button("Portfolio analysieren", id="btn-naive-llm-attribution", color="primary", className="btn-custom mb-3", size="lg"),
+                                        dcc.Loading(id="loading-naive-llm", type="default",
+                                                   children=html.Div(id="naive-llm-output", style={'whiteSpace': 'pre-wrap'}))
                                     ])
                                 ], className="card-custom")
                             ])
@@ -253,7 +252,7 @@ app.layout = html.Div([
                     ])
                 ]),
 
-                dbc.Tab(label="Nachrichten & RAG", tab_id="tab-rag", children=[
+                dbc.Tab(label="LLM mit RAG", tab_id="tab-rag", children=[
                     html.Div([
                         dbc.Row([
                             dbc.Col([
@@ -295,10 +294,9 @@ app.layout = html.Div([
                 ]),
             ], id="tabs", active_tab="tab-overview"),
 
-            dcc.Store(id='portfolio-store', data={'positions': []}),
+            dcc.Store(id='portfolio-store', data={'positions': _initial_positions}),
             dcc.Store(id='analysis-data', data={}),
             dcc.Store(id='rag-status', data={'indexed_tickers': [], 'doc_count': 0}),
-            dcc.Interval(id='auto-load-trigger', interval=500, max_intervals=1),
 
         ], fluid=True, className="main-container")
     ])
@@ -306,12 +304,8 @@ app.layout = html.Div([
 
 # Register callbacks
 from callbacks import register_all
-from utils.finance import fetch_price_at_date
 
 register_all(app, rag_pipeline)
-
-import auto_load
-auto_load.register(app, fetch_price_at_date)
 
 if __name__ == '__main__':
     app.run(debug=True, port=8050)

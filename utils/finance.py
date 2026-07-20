@@ -48,6 +48,29 @@ def adjust_price_for_splits(ticker, price, date):
     return adjusted_price
 
 
+def build_pme_positions(positions, benchmark_prices, benchmark_ticker='SPY'):
+    """Public Market Equivalent (PME): simuliert für jede Position einen Kauf zum
+    selben buy_date im Benchmark-Index, mit demselben investierten Dollarbetrag,
+    damit die Kapitalzufluss-Zeitpunkte des Portfolios und des Benchmarks übereinstimmen."""
+    pme_positions = []
+    for pos in positions:
+        buy_date = pd.to_datetime(pos['buy_date'])
+        if benchmark_prices.index.tz is not None and buy_date.tz is None:
+            buy_date = buy_date.tz_localize(benchmark_prices.index.tz)
+
+        price_at_buy = benchmark_prices.asof(buy_date)
+        if pd.isna(price_at_buy):
+            continue
+
+        invested_amount = pos['shares'] * pos['buy_price']
+        pme_positions.append({
+            'ticker': benchmark_ticker,
+            'shares': invested_amount / price_at_buy,
+            'buy_date': pos['buy_date']
+        })
+    return pme_positions
+
+
 def calculate_portfolio_timeseries(positions):
     if not positions:
         return pd.DataFrame(), pd.DataFrame()

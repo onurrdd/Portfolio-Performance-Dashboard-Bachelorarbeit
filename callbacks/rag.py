@@ -4,6 +4,8 @@ from groq import Groq
 import dash_bootstrap_components as dbc
 from dash import Input, Output, State, html
 
+from prompts import build_advisor_prompt, performance_info_from_analysis_data
+
 logger = logging.getLogger(__name__)
 
 
@@ -61,10 +63,11 @@ def register(app, rag_pipeline):
         [Input('btn-rag-query', 'n_clicks')],
         [State('rag-query-input', 'value'),
          State('rag-topk-input', 'value'),
-         State('rag-status', 'data')],
+         State('rag-status', 'data'),
+         State('analysis-data', 'data')],
         prevent_initial_call=True
     )
-    def query_with_rag(n_clicks, query, topk, rag_status):
+    def query_with_rag(n_clicks, query, topk, rag_status, analysis_data):
         if not n_clicks or not rag_pipeline:
             return dbc.Alert("RAG Pipeline nicht verfügbar oder nicht initialisiert", color="warning")
         if not query:
@@ -81,18 +84,8 @@ def register(app, rag_pipeline):
 
             context = rag_pipeline.format_context_for_llm(retrieved, max_tokens=2000)
 
-            prompt = f"""Du bist ein Finanzanalyst. Beantworte die folgende Frage basierend auf den gegebenen Nachrichten-Kontext.
-
-KONTEXT (Nachrichten):
-{context}
-
-FRAGE: {query}
-
-Bitte:
-1. Beantworte die Frage basierend auf den gegebenen Nachrichten
-2. Zitiere die Quellen (Links) wo relevant
-3. Markiere besonders wichtige Punkte
-4. Halte die Antwort prägnant (max 500 Wörter)"""
+            performance_info = performance_info_from_analysis_data(analysis_data)
+            prompt = build_advisor_prompt(performance_info=performance_info, news_context=context, user_question=query)
 
             try:
                 client = Groq(api_key=os.environ.get("GROQ_API_KEY"))

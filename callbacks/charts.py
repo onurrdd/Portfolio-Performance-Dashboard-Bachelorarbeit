@@ -9,6 +9,7 @@ from utils.finance import (
     calculate_portfolio_timeseries,
     adjust_shares_for_splits,
     adjust_price_for_splits,
+    build_pme_positions,
 )
 from utils.metrics import (
     calculate_twr_metrics,
@@ -250,48 +251,104 @@ def register(app):
                 fig5 = ef
 
             # Benchmark
+            benchmark_stats = {'total_return': 0, 'sortino': 0, 'sharpe_current': 0}
             try:
                 spy = yf.Ticker('SPY')
                 spy_hist = spy.history(start=df['Date'].min(), end=df['Date'].max())
                 if not spy_hist.empty:
-                    port_norm = (df['Portfolio_Value'] / df['Portfolio_Value'].iloc[0]) * 100
-                    spy_norm = (spy_hist['Close'] / spy_hist['Close'].iloc[0]) * 100
+                    # Public Market Equivalent (PME)-Anpassung: simuliert die gleichen
+                    # Kapitalzuflüsse (buy_date, investierter Betrag) im S&P 500, damit
+                    # Total Return/Sortino/Sharpe zeitgleich und fair vergleichbar sind.
+                    pme_positions = build_pme_positions(positions, spy_hist['Close'])
+                    pme_price_df = spy_hist['Close'].to_frame(name='SPY')
+                    twr_pme = calculate_twr_metrics(pme_positions, pme_price_df)
+
+                    if twr_pme is not None:
+                        spy_total_return = twr_pme['total_return']
+                        spy_sortino = twr_pme['sortino']
+                        spy_rolling_sharpe = twr_pme['rolling_sharpe']
+                        spy_returns_for_chart = twr_pme['returns']
+                    else:
+                        spy_returns_for_chart = spy_hist['Close'].pct_change().dropna()
+                        spy_total_return = (spy_hist['Close'].iloc[-1] / spy_hist['Close'].iloc[0] - 1) * 100
+                        spy_sortino = calculate_sortino_ratio(spy_returns_for_chart)
+                        spy_rolling_sharpe = calculate_rolling_sharpe(spy_returns_for_chart)
+
+                    # Beide Linien als kapitalflussbereinigte kumulierte Rendite (%):
+                    # zeigt reale Performance statt Kontostand-Wachstum durch Kapitalzuflüsse.
+                    port_cum_return = ((1 + returns).cumprod() - 1) * 100
+                    spy_cum_return = ((1 + spy_returns_for_chart).cumprod() - 1) * 100
+                    port_dates = returns.index if twr is not None else df.loc[returns.index, 'Date']
 
                     fig6 = go.Figure()
-                    fig6.add_trace(go.Scatter(x=df['Date'], y=port_norm, mode='lines',
+                    fig6.add_trace(go.Scatter(x=port_dates, y=port_cum_return, mode='lines',
                                               name='Portfolio', line=dict(color=ACCENT, width=2)))
-                    fig6.add_trace(go.Scatter(x=spy_hist.index, y=spy_norm, mode='lines',
-                                              name='S&P 500 (SPY)', line=dict(color='#8b949e', width=2, dash='dash')))
+                    fig6.add_trace(go.Scatter(x=spy_cum_return.index, y=spy_cum_return, mode='lines',
+                                              name='S&P 500', line=dict(color='#8b949e', width=2, dash='dash')))
                     fig6.update_layout(
-                        title={'text': "Portfolio vs. S&P 500 Benchmark (Normalisiert auf 100)", 'font': {'size': 18, 'color': '#f0f6fc'}},
-                        xaxis_title="Datum", yaxis_title="Indexiert (Start = 100)",
+                        title={'text': "Portfolio vs. S&P 500 Benchmark", 'font': {'size': 18, 'color': '#f0f6fc'}},
+                        xaxis_title="Datum", yaxis_title="Kumulierte Rendite (%)",
                         hovermode='x unified', height=500,
                         legend=dict(yanchor="top", y=0.99, xanchor="left", x=0.01),
                         **_COMMON
                     )
 
-                    spy_returns = spy_hist['Close'].pct_change().dropna()
-                    spy_total_return = (spy_hist['Close'].iloc[-1] / spy_hist['Close'].iloc[0] - 1) * 100
                     portfolio_vs_spy = total_return - spy_total_return
 
-                    benchmark_metrics = dbc.Row([
-                        dbc.Col([dbc.Card([dbc.CardBody([
-                            html.H5("Portfolio Return (TWR)", className="text-muted"),
-                            html.H3(f"{total_return:.2f}%", style={'color': '#f0f6fc', 'fontWeight': '700'})
-                        ])], className="card-custom")], width=3),
-                        dbc.Col([dbc.Card([dbc.CardBody([
-                            html.H5("S&P 500 Return", className="text-muted"),
-                            html.H3(f"{spy_total_return:.2f}%", style={'color': '#8b949e', 'fontWeight': '700'})
-                        ])], className="card-custom")], width=3),
-                        dbc.Col([dbc.Card([dbc.CardBody([
-                            html.H5("Outperformance", className="text-muted"),
-                            html.H3(f"{portfolio_vs_spy:+.2f}%",
-                                   style={'color': '#28a745' if portfolio_vs_spy > 0 else '#dc3545', 'fontWeight': '700'})
-                        ])], className="card-custom")], width=3),
-                        dbc.Col([dbc.Card([dbc.CardBody([
-                            html.H5("Portfolio Volatilität", className="text-muted"),
-                            html.H3(f"{volatility:.2f}%", style={'color': '#8b949e', 'fontWeight': '700'})
-                        ])], className="card-custom")], width=3),
+                    spy_rs_valid = spy_rolling_sharpe.dropna()
+                    spy_sharpe_current = spy_rs_valid.iloc[-1] if not spy_rs_valid.empty else np.nan
+
+                    portfolio_rs_valid = rolling_sharpe.dropna()
+                    portfolio_sharpe_current = portfolio_rs_valid.iloc[-1] if not portfolio_rs_valid.empty else np.nan
+
+                    benchmark_stats = {
+                        'total_return': float(spy_total_return),
+                        'sortino': float(spy_sortino) if not np.isnan(spy_sortino) else 0,
+                        'sharpe_current': float(spy_sharpe_current) if not np.isnan(spy_sharpe_current) else 0,
+                    }
+
+                    benchmark_metrics = html.Div([
+                        dbc.Row([
+                            dbc.Col([dbc.Card([dbc.CardBody([
+                                html.H5("Portfolio Return (TWR)", className="text-muted"),
+                                html.H3(f"{total_return:.2f}%", style={'color': '#f0f6fc', 'fontWeight': '700'})
+                            ])], className="card-custom")], width=3),
+                            dbc.Col([dbc.Card([dbc.CardBody([
+                                html.H5("S&P 500 Return (PME)", className="text-muted"),
+                                html.H3(f"{spy_total_return:.2f}%", style={'color': '#8b949e', 'fontWeight': '700'})
+                            ])], className="card-custom")], width=3),
+                            dbc.Col([dbc.Card([dbc.CardBody([
+                                html.H5("Outperformance (PME)", className="text-muted"),
+                                html.H3(f"{portfolio_vs_spy:+.2f}%",
+                                       style={'color': '#28a745' if portfolio_vs_spy > 0 else '#dc3545', 'fontWeight': '700'})
+                            ])], className="card-custom")], width=3),
+                            dbc.Col([dbc.Card([dbc.CardBody([
+                                html.H5("Portfolio Volatilität", className="text-muted"),
+                                html.H3(f"{volatility:.2f}%", style={'color': '#8b949e', 'fontWeight': '700'})
+                            ])], className="card-custom")], width=3),
+                        ]),
+                        dbc.Row([
+                            dbc.Col([dbc.Card([dbc.CardBody([
+                                html.H5("Portfolio Sortino Ratio", className="text-muted"),
+                                html.H3(f"{sortino:.3f}" if not np.isnan(sortino) else "N/A",
+                                       style={'color': '#f0f6fc', 'fontWeight': '700'})
+                            ])], className="card-custom")], width=3),
+                            dbc.Col([dbc.Card([dbc.CardBody([
+                                html.H5("S&P 500 Sortino Ratio (PME)", className="text-muted"),
+                                html.H3(f"{spy_sortino:.3f}" if not np.isnan(spy_sortino) else "N/A",
+                                       style={'color': '#8b949e', 'fontWeight': '700'})
+                            ])], className="card-custom")], width=3),
+                            dbc.Col([dbc.Card([dbc.CardBody([
+                                html.H5("Portfolio Sharpe Ratio", className="text-muted"),
+                                html.H3(f"{portfolio_sharpe_current:.3f}" if not np.isnan(portfolio_sharpe_current) else "N/A",
+                                       style={'color': '#f0f6fc', 'fontWeight': '700'})
+                            ])], className="card-custom")], width=3),
+                            dbc.Col([dbc.Card([dbc.CardBody([
+                                html.H5("S&P 500 Sharpe Ratio (PME)", className="text-muted"),
+                                html.H3(f"{spy_sharpe_current:.3f}" if not np.isnan(spy_sharpe_current) else "N/A",
+                                       style={'color': '#8b949e', 'fontWeight': '700'})
+                            ])], className="card-custom")], width=3),
+                        ], className="mt-3"),
                     ])
                 else:
                     fig6, benchmark_metrics = ef, dbc.Alert("Benchmark-Daten nicht verfügbar", color="warning")
@@ -342,7 +399,8 @@ def register(app):
                 },
                 'correlation_stats': correlation_stats,
                 'asset_volatilities': asset_volatilities,
-                'correlation_matrix': corr_matrix.to_dict() if not corr_matrix.empty else {}
+                'correlation_matrix': corr_matrix.to_dict() if not corr_matrix.empty else {},
+                'benchmark': benchmark_stats
             }
 
             return portfolio_table, metrics, fig1, fig2, fig3, fig4, fig5, fig6, benchmark_metrics, analysis_data
