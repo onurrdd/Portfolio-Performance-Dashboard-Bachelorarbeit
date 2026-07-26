@@ -249,6 +249,17 @@ app.layout = html.Div([
                                 ], className="card-custom")
                             ])
                         ], className="mt-4"),
+                        dbc.Row([
+                            dbc.Col([
+                                dbc.Button("Anomalietage anzeigen (vorübergehend/Debug)", id="btn-toggle-breaks",
+                                          color="secondary", className="btn-custom mb-3"),
+                                dbc.Collapse(
+                                    html.Div(id="breaks-table-container"),
+                                    id="collapse-breaks",
+                                    is_open=False,
+                                )
+                            ])
+                        ]),
                     ])
                 ]),
 

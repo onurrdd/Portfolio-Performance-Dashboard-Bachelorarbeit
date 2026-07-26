@@ -53,6 +53,7 @@ def calculate_twr_metrics(positions, price_df):
         buy_dates.append(pd.Timestamp.now())
 
     all_daily_returns = []
+    all_return_dates = []
     all_portfolio_values = []
     all_dates = []
 
@@ -91,19 +92,18 @@ def calculate_twr_metrics(positions, price_df):
         all_portfolio_values.extend(period_values)
         all_dates.extend(period_dates_valid)
 
-        if len(period_values) >= 2:
-            start_idx = len(all_portfolio_values) - len(period_values)
-            for j in range(start_idx + 1, len(all_portfolio_values)):
-                if all_portfolio_values[j - 1] > 0:
-                    all_daily_returns.append(
-                        (all_portfolio_values[j] / all_portfolio_values[j - 1]) - 1
-                    )
+        # Tagesrenditen NUR innerhalb der Periode (Seam/Kapitalzufluss wird übersprungen).
+        # Jede Rendite wird mit ihrem END-Datum beschriftet, damit sich die Datumslabels
+        # an Perioden-Grenzen nicht verschieben.
+        for k in range(1, len(period_values)):
+            if period_values[k - 1] > 0:
+                all_daily_returns.append((period_values[k] / period_values[k - 1]) - 1)
+                all_return_dates.append(period_dates_valid[k])
 
     if not all_daily_returns:
         return None
 
-    returns_dates = all_dates[1:len(all_daily_returns) + 1]
-    returns_series = pd.Series(all_daily_returns, index=returns_dates)
+    returns_series = pd.Series(all_daily_returns, index=all_return_dates)
     portfolio_series = pd.Series(all_portfolio_values, index=all_dates)
 
     volatility = returns_series.std() * np.sqrt(252) * 100

@@ -11,6 +11,7 @@ from utils.finance import (
     adjust_price_for_splits,
     build_pme_positions,
 )
+from utils.anomaly import detect_anomalies
 from utils.metrics import (
     calculate_twr_metrics,
     calculate_sortino_ratio,
@@ -252,6 +253,7 @@ def register(app):
 
             # Benchmark
             benchmark_stats = {'total_return': 0, 'sortino': 0, 'sharpe_current': 0}
+            active_return_breaks = []
             try:
                 spy = yf.Ticker('SPY')
                 spy_hist = spy.history(start=df['Date'].min(), end=df['Date'].max())
@@ -279,6 +281,12 @@ def register(app):
                     port_cum_return = ((1 + returns).cumprod() - 1) * 100
                     spy_cum_return = ((1 + spy_returns_for_chart).cumprod() - 1) * 100
                     port_dates = returns.index if twr is not None else df.loc[returns.index, 'Date']
+
+                    # Anomalie-Erkennung (Plan B): Market-Model-Surprise + robuster
+                    # Median/MAD-z-Score, siehe utils/anomaly.py und ANOMALY_DETECTION.md.
+                    active_return_breaks = detect_anomalies(
+                        returns, spy_returns_for_chart, positions, price_df
+                    )
 
                     fig6 = go.Figure()
                     fig6.add_trace(go.Scatter(x=port_dates, y=port_cum_return, mode='lines',
@@ -400,7 +408,8 @@ def register(app):
                 'correlation_stats': correlation_stats,
                 'asset_volatilities': asset_volatilities,
                 'correlation_matrix': corr_matrix.to_dict() if not corr_matrix.empty else {},
-                'benchmark': benchmark_stats
+                'benchmark': benchmark_stats,
+                'active_return_breaks': active_return_breaks
             }
 
             return portfolio_table, metrics, fig1, fig2, fig3, fig4, fig5, fig6, benchmark_metrics, analysis_data

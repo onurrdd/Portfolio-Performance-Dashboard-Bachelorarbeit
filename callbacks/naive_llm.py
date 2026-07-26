@@ -1,4 +1,5 @@
 import os
+import pandas as pd
 from groq import Groq
 import dash_bootstrap_components as dbc
 from dash import Input, Output, State, html
@@ -30,6 +31,31 @@ better or worse than the S&P 500 benchmark shown above (e.g. sector/stock exposu
 RESPONSE_LANGUAGE_INSTRUCTIONS = {
     "de": "\nPlease respond in German.",
     "tr": "\nPlease respond in Turkish.",
+}
+
+# Anzeigesprache der Anomalie-Tabelle (unabhängig von RESPONSE_LANGUAGE): "tr" oder "de"
+TABLE_LANGUAGE = "de"
+
+TABLE_HEADERS = {
+    "tr": ['#', 'Tarih', 'Gerçekleşen', 'Beklenen', 'Sürpriz', 'Sürpriz (MAD-z)',
+           'Benchmark (MAD-z)', 'β', 'Sınıf', 'Sorumlu Ticker', 'Uyarı'],
+    "de": ['#', 'Datum', 'Tatsächlich', 'Erwartet', 'Überraschung', 'Überraschung (MAD-z)',
+           'Benchmark (MAD-z)', 'β', 'Klasse', 'Verantwortlicher Ticker', 'Warnung'],
+}
+
+CLASSIFICATION_LABELS = {
+    "tr": {"Portföye özgü": "Portföye özgü", "Kopma": "Kopma"},
+    "de": {"Portföye özgü": "Portfolio-spezifisch", "Kopma": "Entkopplung"},
+}
+
+CONCENTRATION_LABELS = {
+    "tr": {"Hisseye özgü": "Hisseye özgü", "Faktör/Sektör": "Faktör/Sektör"},
+    "de": {"Hisseye özgü": "Einzeltitel", "Faktör/Sektör": "Faktor/Sektor"},
+}
+
+TABLE_TEXT = {
+    "tr": {"no_breaks": "Anomali günü tespit edilmedi.", "not_attributable": "— (atfedilemez)", "dash": "—"},
+    "de": {"no_breaks": "Kein Anomalietag festgestellt.", "not_attributable": "— (nicht zuordenbar)", "dash": "—"},
 }
 
 
@@ -99,3 +125,50 @@ def register(app):
                     html.Li("API-Rate-Limit erreicht")
                 ])])
             ], color="danger")
+
+    @app.callback(
+        Output('collapse-breaks', 'is_open'),
+        Output('breaks-table-container', 'children'),
+        Input('btn-toggle-breaks', 'n_clicks'),
+        State('collapse-breaks', 'is_open'),
+        State('analysis-data', 'data'),
+        prevent_initial_call=True
+    )
+    def toggle_breaks_table(n_clicks, is_open, analysis_data):
+        breaks = (analysis_data or {}).get('active_return_breaks', [])
+        lang = TABLE_LANGUAGE if TABLE_LANGUAGE in TABLE_HEADERS else "tr"
+        text = TABLE_TEXT[lang]
+        class_labels = CLASSIFICATION_LABELS[lang]
+        conc_labels = CONCENTRATION_LABELS[lang]
+
+        if not breaks:
+            content = dbc.Alert(text["no_breaks"], color="info")
+        else:
+            df = pd.DataFrame(breaks)
+
+            def _ticker_cell(row):
+                if not row['responsible_ticker']:
+                    return text["not_attributable"]
+                conc = row.get('concentration')
+                conc_label = f" · {conc_labels.get(conc, conc)}" if conc else ""
+                return f"{row['responsible_ticker']} ({row['ticker_contribution_pct']:+.2f}%){conc_label}"
+
+            out = pd.DataFrame({
+                'date': df['date'],
+                'actual': df['actual_return_pct'].apply(lambda x: f"{x:+.2f}%"),
+                'expected': df['expected_return_pct'].apply(lambda x: f"{x:+.2f}%" if pd.notna(x) else text["dash"]),
+                'surprise': df['surprise_pct'].apply(lambda x: f"{x:+.2f}%"),
+                'surprise_z': df['surprise_mad_z'].apply(lambda x: f"{x:+.2f}"),
+                'benchmark_z': df['benchmark_mad_z'].apply(lambda x: f"{x:+.2f}" if pd.notna(x) else text["dash"]),
+                'beta': df['beta'].apply(lambda x: f"{x:.2f}" if pd.notna(x) else text["dash"]),
+                'classification': df['classification'].apply(lambda c: class_labels.get(c, c)),
+                'ticker': df.apply(_ticker_cell, axis=1),
+                'flags': df['flags'].apply(lambda x: x if x else text["dash"]),
+            })
+            out.insert(0, '#', range(1, len(out) + 1))
+            out.columns = TABLE_HEADERS[lang]
+            content = dbc.Table.from_dataframe(
+                out, striped=True, bordered=True, hover=True, responsive=True, className="mt-2"
+            )
+
+        return not is_open, content
