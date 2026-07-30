@@ -76,8 +76,8 @@ TABLE_HEADERS = {
 }
 
 CONCENTRATION_LABELS = {
-    "tr": {"Hisseye özgü": "Hisseye özgü", "Faktör/Sektör": "Faktör/Sektör"},
-    "de": {"Hisseye özgü": "Einzeltitel", "Faktör/Sektör": "Faktor/Sektor"},
+    "tr": {"Hisseye özgü": "Hisseye özgü", "Dağılmış": "Dağılmış"},
+    "de": {"Hisseye özgü": "Einzeltitel", "Dağılmış": "Verteilt"},
 }
 
 TABLE_TEXT = {

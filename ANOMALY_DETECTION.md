@@ -53,7 +53,10 @@ bir önceki güne birebir eşit mi (stale/ffill artefaktı).
 **Adım 6 — Ticker kırılımı (işaret-tutarlı).** Sürprizin yönüyle **aynı yönde** katkı
 yapan (ağırlık × günlük getiri) tickerlar arasından en büyüğü "sorumlu" seçilir.
 Sürpriz yönünde hiç ticker yoksa "atfedilemez" denir. Konsantrasyon
-(`|en büyük| / Σ|aynı yönlü|`) > 0.6 ise **"Hisseye özgü"**, değilse **"Faktör/Sektör"**.
+(`|en büyük| / Σ|aynı yönlü|`) > 0.6 ise **"Hisseye özgü"**, değilse **"Dağılmış"**.
+Not: "Dağılmış" yalnızca sürprizin tek bir tickera yoğunlaşmadığını, birden fazla
+pozisyona yayıldığını belirtir — sektör veya faktör analizi yapılmaz, bu bir
+nedensellik iddiası değildir.
 
 ## Parametreler
 
@@ -63,13 +66,13 @@ Sürpriz yönünde hiç ticker yoksa "atfedilemez" denir. Konsantrasyon
 | Min. gözlem | 40 | `min_periods=40`: pencere 60'a dolmadan, 40 geçerli gözlemle değer üretilmeye başlanır |
 | Isınma | ~40 gün | Raporlanmaz; ilk geçerli değer 40. günde çıkar (60 değil — doğrulandı: [utils/anomaly.py](utils/anomaly.py) `MIN_OBS`) |
 | Eşik | \|mad_z\| > 3 | MAD ölçeğinde (≈ 2σ'ya yakın) |
-| Konsantrasyon sınırı | 0.6 | Hisse- vs. faktör-olayı |
+| Konsantrasyon sınırı | 0.6 | Hisseye özgü vs. dağılmış |
 
 ## Mevcut veri üzerindeki doğrulama (5 tickerlı test portföyü)
 
 - **13 anomali günü**, işaretlenme oranı **~%1.8** (hedef %1-3 ✓).
 - Sınıflandırma: 13/13 "Portföye özgü", 0 "Kopma".
-- Konsantrasyon: 9 "Hisseye özgü", 4 "Faktör/Sektör".
+- Konsantrasyon: 9 "Hisseye özgü", 4 "Dağılmış".
 - Uyarı bayrağı: 0 gün.
 
 ### Neden "Kopma" hiç çıkmıyor

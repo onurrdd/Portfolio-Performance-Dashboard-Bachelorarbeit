@@ -13,7 +13,10 @@ Ansatz (Market-Model + robuste Ausreißererkennung):
        Benchmark normal  → "Portföye özgü" (portfolio-spezifisch)
   5. Billige Filter: Kaufdatum ±1 Tag, stale/ffill-Preis am Tag.
   6. Ticker-Zerlegung: welcher Titel trägt den Surprise (vorzeichentreu)?
-     Konzentration → "Hisseye özgü" (Einzeltitel) vs. "Faktör/Sektör".
+     Konzentration → "Hisseye özgü" (Einzeltitel) vs. "Dağılmış" (Verteilt).
+     Hinweis: "Dağılmış" beschreibt nur, dass der Surprise nicht auf einen Titel
+     konzentriert ist — es ist KEINE Aussage über Sektor- oder Faktorzugehörigkeit
+     (diese werden hier nicht gemessen).
 """
 import numpy as np
 import pandas as pd
@@ -22,7 +25,7 @@ WINDOW = 60          # Rollierendes Fenster (Handelstage)
 MIN_OBS = 40         # Mindestanzahl gültiger Beobachtungen im Fenster
 MAD_Z_THRESHOLD = 3  # Feste Schwelle auf robustem z-Score
 _MAD_SCALE = 1.4826  # MAD → σ-Äquivalent bei Normalverteilung
-_CONCENTRATION_CUTOFF = 0.6  # Einzeltitel- vs. Faktor-Grenze
+_CONCENTRATION_CUTOFF = 0.6  # Einzeltitel- vs. verteilt-Grenze
 
 
 def _rolling_mad(series, window, min_obs):
@@ -124,7 +127,7 @@ def _ticker_attribution(day, surprise_value, positions, price_df, ticker_returns
     top_value = same_dir[top_ticker]
     denom = sum(abs(c) for c in same_dir.values())
     concentration_ratio = abs(top_value) / denom if denom > 0 else 0
-    concentration = 'Hisseye özgü' if concentration_ratio > _CONCENTRATION_CUTOFF else 'Faktör/Sektör'
+    concentration = 'Hisseye özgü' if concentration_ratio > _CONCENTRATION_CUTOFF else 'Dağılmış'
     # Eigene (ungewichtete) Tagesrendite des Tickers — wichtig für "warum ist X um Y% gestiegen"-Fragen,
     # da der gewichtete Portfolio-Beitrag (top_value) durch die Portfoliogewichtung verwässert ist.
     own_return_pct = float(own_returns[top_ticker] * 100)
