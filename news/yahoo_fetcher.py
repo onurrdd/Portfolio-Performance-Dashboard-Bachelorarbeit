@@ -127,13 +127,33 @@ class YahooFinanceFetcher:
 def fetch_news_batch(tickers: List[str], limit: int = 5) -> Dict[str, List[Dict]]:
     """
     Convenience function to fetch news for multiple tickers.
-    
+
     Args:
         tickers: List of ticker symbols
         limit: Max articles per ticker
-        
+
     Returns:
         Dictionary mapping ticker to list of articles
     """
     fetcher = YahooFinanceFetcher()
     return fetcher.fetch_news_for_tickers(tickers, limit)
+
+
+class YahooRSSSource:
+    """NewsSource-Adapter für den bestehenden YahooFinanceFetcher.
+
+    Macht den Fetcher zu einer austauschbaren Quelle (news.base.NewsSource) und
+    normalisiert das published-Feld (RSS RFC-822 → ISO). RSS liefert nur die
+    neuesten Artikel, daher werden start/end ignoriert.
+    """
+    name = "yahoo_rss"
+
+    def __init__(self):
+        self._fetcher = YahooFinanceFetcher()
+
+    def fetch(self, ticker: str, limit: int = 10, start=None, end=None) -> List[Dict]:
+        from news.base import normalize_published
+        articles = self._fetcher.fetch_news_for_ticker(ticker, limit)
+        for a in articles:
+            a["published"] = normalize_published(a.get("published"))
+        return articles

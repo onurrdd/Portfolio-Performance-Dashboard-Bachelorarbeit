@@ -60,8 +60,8 @@ Sürpriz yönünde hiç ticker yoksa "atfedilemez" denir. Konsantrasyon
 | Parametre | Değer | Not |
 |---|---|---|
 | Pencere | 60 işlem günü | Beta ve MAD tahmini |
-| Min. gözlem | 40 | Pencerede en az |
-| Isınma | ~60 gün | Raporlanmaz (yeterli geçmiş yok) |
+| Min. gözlem | 40 | `min_periods=40`: pencere 60'a dolmadan, 40 geçerli gözlemle değer üretilmeye başlanır |
+| Isınma | ~40 gün | Raporlanmaz; ilk geçerli değer 40. günde çıkar (60 değil — doğrulandı: [utils/anomaly.py](utils/anomaly.py) `MIN_OBS`) |
 | Eşik | \|mad_z\| > 3 | MAD ölçeğinde (≈ 2σ'ya yakın) |
 | Konsantrasyon sınırı | 0.6 | Hisse- vs. faktör-olayı |
 
@@ -98,3 +98,6 @@ ticker_contribution_pct, concentration, flags`.
   portföyde beta oynak); sınıflandırmayı sınırda etkileyebilir.
 - Ticker kırılımı, sürprizi değil **gerçekleşen getiriyi** ayrıştırır (ticker-bazlı
   beta düzeltmesi yapılmaz) — lean bir yaklaşım, yön ve konsantrasyon için yeterli.
+- Sayısal koruma: bir pencerede benchmark varyansı veya MAD tam olarak 0 çıkarsa
+  (aşırı durgun/veri eksikliği) o günün z-skoru NaN olur ve otomatik elenir.
+- Ticker kırılımında katkısı tam olarak 0 olan bir hisse "aynı yönlü" sayılmaz.

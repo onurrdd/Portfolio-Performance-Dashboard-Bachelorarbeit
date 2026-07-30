@@ -1,140 +1,265 @@
 import os
 import logging
+import threading
+from datetime import datetime
+import pandas as pd
 from groq import Groq
 import dash_bootstrap_components as dbc
-from dash import Input, Output, State, html
+from dash import Input, Output, State, html, no_update
 
-from prompts import build_advisor_prompt, performance_info_from_analysis_data
+# Identischer Prompt-Builder wie im Naive-Tab — garantiert denselben Prompt.
+from callbacks.naive_llm import build_portfolio_prompt, PROMPT_DEBUG_STYLE
 
 logger = logging.getLogger(__name__)
 
+MODEL = "llama-3.3-70b-versatile"
+MAX_TOKENS = 4096
 
-def register(app, rag_pipeline):
-    @app.callback(
-        [Output('rag-fetch-status', 'children'),
-         Output('rag-status', 'data')],
-        [Input('btn-rag-fetch', 'n_clicks')],
-        [State('rag-ticker-input', 'value'),
-         State('rag-limit-input', 'value')],
-        prevent_initial_call=True
-    )
-    def fetch_and_index_news(n_clicks, tickers_str, limit):
-        if not n_clicks or not rag_pipeline:
-            return dbc.Alert("RAG Pipeline nicht verfügbar", color="warning"), {}
-        if not tickers_str:
-            return dbc.Alert("Bitte Ticker eingeben (komma-getrennt)", color="warning"), {}
+# Serialisiert JEDEN Zugriff auf Vektorspeicher/Cache (FAISS ist nicht thread-sicher).
+# Auto-Fetch (Hintergrund) und manuelle Analyse dürfen den Store nicht gleichzeitig anfassen.
+_rag_lock = threading.Lock()
 
+
+def _single_stock_anomalies(analysis_data):
+    """Einzeltitel-Anomalien (concentration == 'Hisseye özgü' mit verantwortlichem Ticker)."""
+    return [
+        b for b in (analysis_data or {}).get('active_return_breaks', [])
+        if b.get('concentration') == 'Hisseye özgü' and b.get('responsible_ticker')
+    ]
+
+
+def _index_anomaly_news(pipeline, analysis_data):
+    """Indiziert Nachrichten NUR für Einzeltitel-Anomalien: je Anomalie den verantwortlichen
+    Ticker mit target_day = Anomaliedatum. Nur Nachricht im Fenster [Datum ± Fenster] landet
+    im Vektorindex (siehe RAGPipeline.index_news_for_tickers)."""
+    for b in _single_stock_anomalies(analysis_data):
+        ticker = b.get('responsible_ticker')
+        date_str = b.get('date')
+        if not (ticker and date_str):
+            continue
         try:
-            tickers = [t.strip().upper() for t in tickers_str.split(',')]
-            limit = int(limit) if limit else 5
+            day = datetime.fromisoformat(str(date_str)[:10])
+        except ValueError:
+            continue
+        # Index-Fenster == Retrieval-Fenster (anomaly_window_days), damit indizierte und
+        # später abgerufene Nachricht denselben Zeitraum abdecken.
+        pipeline.index_news_for_tickers(
+            [ticker], target_day=day,
+            coverage_window_days=pipeline.config.anomaly_window_days)
 
-            stats = rag_pipeline.index_news_for_tickers(tickers, news_limit=limit)
-            db_stats = rag_pipeline.get_stats()
 
-            status_msg = dbc.Alert([
-                html.H5("✅ Nachrichten erfolgreich indiziert!", className="mb-2"),
-                dbc.Row([
-                    dbc.Col([html.P(f"Ticker verarbeitet: {stats['tickers_successful']} / {stats['tickers_processed']}")], width=6),
-                    dbc.Col([html.P(f"Artikel: {stats['total_articles']}")], width=6)
-                ]),
-                dbc.Row([
-                    dbc.Col([html.P(f"Chunks erstellt: {stats['total_chunks']}")], width=6),
-                    dbc.Col([html.P(f"Gesamt indexiert: {db_stats['indexed_documents']} Dokumente")], width=6)
-                ]),
-                html.Hr(),
-                html.Small(f"Zeitstempel: {stats['timestamp']}")
-            ], color="success", className="mb-3")
+def _background_index(rag_provider, analysis_data):
+    """Hintergrund-Thread: lädt RAG (lazy) und indiziert Nachrichten NUR für Anomalie-Ticker
+    im jeweiligen Anomaliedatum-Fenster. Mit der aktuellen RSS-Quelle liefert das für
+    vergangene Anomalien (noch) keine Treffer; die Verdrahtung ist bereit, sobald eine
+    datierte Quelle ergänzt wird."""
+    if not _rag_lock.acquire(blocking=False):
+        return  # ein Auto-Fetch läuft bereits
+    try:
+        pipeline = rag_provider.get()
+        if pipeline:
+            _index_anomaly_news(pipeline, analysis_data)
+    except Exception as e:
+        logger.warning(f"Auto-Fetch fehlgeschlagen: {e}")
+    finally:
+        _rag_lock.release()
 
-            return status_msg, {
-                'indexed_tickers': tickers,
-                'doc_count': db_stats['indexed_documents'],
-                'last_index_time': stats['timestamp']
-            }
+# Anzeigesprache der Nachrichtentabelle (Debug)
+NEWS_TABLE_HEADERS = ['#', 'Ticker', 'Datum', 'Titel', 'Quelle', 'Indexiert']
 
-        except Exception as e:
-            logger.error(f"Error indexing news: {e}")
-            return dbc.Alert([
-                html.H5("❌ Fehler beim Indizieren"),
-                html.P(f"Fehler: {str(e)}")
-            ], color="danger"), {}
+
+def _collect_rag_context(rag_pipeline, analysis_data):
+    """Ruft Nachrichten-Kontext ab — NUR für Einzeltitel-Anomalien (Ticker + Zeitfenster).
+
+    Kein Fallback und KEINE allgemeinen Nachrichten. Gibt es für eine Anomalie im Fenster
+    keine passende Nachricht, bleibt der Kontext insoweit leer. Rückgabe: (kontext, chunks).
+    """
+    retrieved, seen = [], set()
+    for b in _single_stock_anomalies(analysis_data):
+        chunks = rag_pipeline.retrieve_for_anomaly(
+            "reason for the stock price move, earnings, guidance or company news",
+            b, top_k=3)
+        for c in chunks:
+            link = c.get('metadata', {}).get('link', '')
+            key = link or c.get('text', '')[:80]
+            if key not in seen:
+                seen.add(key)
+                retrieved.append(c)
+
+    context = rag_pipeline.format_context_for_llm(retrieved, max_tokens=2000)
+    return context, retrieved
+
+
+def register(app, rag_provider):
 
     @app.callback(
-        Output('rag-results-output', 'children'),
-        [Input('btn-rag-query', 'n_clicks')],
-        [State('rag-query-input', 'value'),
-         State('rag-topk-input', 'value'),
-         State('rag-status', 'data'),
-         State('analysis-data', 'data')],
-        prevent_initial_call=True
+        Output('rag-status', 'data'),
+        Input('analysis-data', 'data'),
+        prevent_initial_call=True,
     )
-    def query_with_rag(n_clicks, query, topk, rag_status, analysis_data):
-        if not n_clicks or not rag_pipeline:
+    def auto_fetch_news(analysis_data):
+        """Automatischer Nachrichten-Abruf, sobald Portfolio + Anomalien berechnet sind.
+
+        Läuft OHNE Klick auf 'Mit RAG analysieren'. Startet den Fetch in einem
+        Hintergrund-Thread, damit die UI nicht blockiert wird (und RAG erst hier — nach
+        App-Start, Tickern, Anomalien — lazy geladen wird). Der Cache verhindert
+        wiederholtes Laden bei erneuten Auslösungen.
+        """
+        if not analysis_data or not _single_stock_anomalies(analysis_data):
+            return no_update  # keine Einzeltitel-Anomalie → nichts abzurufen
+
+        threading.Thread(
+            target=_background_index,
+            args=(rag_provider, analysis_data),
+            daemon=True,
+        ).start()
+        return no_update
+
+    @app.callback(
+        Output('rag-llm-output', 'children'),
+        [Input('btn-rag-analyze', 'n_clicks')],
+        [State('analysis-data', 'data')],
+        prevent_initial_call=True,
+    )
+    def analyze_with_rag(n_clicks, analysis_data):
+        if not n_clicks:
+            return ""
+        # RAG wird hier beim ersten Klick geladen (lazy) — nicht beim App-Start.
+        rag_pipeline = rag_provider.get()
+        if not rag_pipeline:
             return dbc.Alert("RAG Pipeline nicht verfügbar oder nicht initialisiert", color="warning")
-        if not query:
-            return dbc.Alert("Bitte eine Frage eingeben", color="warning")
-        if rag_status.get('doc_count', 0) == 0:
-            return dbc.Alert("Keine Nachrichten indexiert. Bitte zuerst Nachrichten abrufen.", color="info")
+        if not analysis_data or not analysis_data.get('positions'):
+            return dbc.Alert("Keine Portfolio-Daten verfügbar. Bitte füge zuerst Positionen hinzu.", color="warning")
 
         try:
-            topk = int(topk) if topk else 5
-            retrieved = rag_pipeline.retrieve_context(query, top_k=topk)
+            # 1+2) NUR anomalie-bezogene Nachrichten indizieren und abrufen — unter dem
+            # Store-Lock (kein paralleler Zugriff mit dem Auto-Fetch-Thread).
+            with _rag_lock:
+                _index_anomaly_news(rag_pipeline, analysis_data)
+                context, retrieved = _collect_rag_context(rag_pipeline, analysis_data)
 
-            if not retrieved:
-                return dbc.Alert("Keine relevanten Nachrichten gefunden", color="info")
+            # 3) IDENTISCHER Prompt wie im Naive-Tab, plus abgerufener Nachrichten-Kontext.
+            prompt = build_portfolio_prompt(analysis_data, news_context=context or None)
 
-            context = rag_pipeline.format_context_for_llm(retrieved, max_tokens=2000)
+            client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
+            response = client.chat.completions.create(
+                messages=[{"role": "user", "content": prompt}],
+                model=MODEL,
+                max_tokens=MAX_TOKENS,
+            )
+            llm_response = response.choices[0].message.content
 
-            performance_info = performance_info_from_analysis_data(analysis_data)
-            prompt = build_advisor_prompt(performance_info=performance_info, news_context=context, user_question=query)
-
-            try:
-                client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
-                response = client.chat.completions.create(
-                    messages=[{"role": "user", "content": prompt}],
-                    model="llama-3.3-70b-versatile",
-                    max_tokens=2048,
-                )
-                llm_response = response.choices[0].message.content
-            except Exception as e:
-                logger.warning(f"Groq API error: {e}")
-                llm_response = f"Groq API nicht verfügbar. Hier sind die gefundenen Nachrichten:\n\n{context}"
-
-            result_components = [
-                html.H5("🤖 RAG-gestützte Antwort", style={'color': '#58a6ff', 'marginTop': '20px', 'marginBottom': '10px'}),
-                html.Div(llm_response, style={
-                    'whiteSpace': 'pre-wrap', 'lineHeight': '1.6', 'fontSize': '0.95rem',
-                    'color': '#f0f6fc', 'marginBottom': '20px', 'padding': '15px',
-                    'backgroundColor': '#0d1117', 'borderLeft': '3px solid #58a6ff', 'borderRadius': '4px'
-                }),
-                html.Hr(),
-                html.H5("📰 Quelle (Top-K Nachrichten)", style={'color': '#79c0ff', 'marginBottom': '10px'}),
+            # Antwort
+            components = [
+                dbc.Card([dbc.CardBody([
+                    html.H5("RAG-gestützte Analyse", className="mb-3", style={'color': '#f0f6fc'}),
+                    html.Div(llm_response, style={
+                        'whiteSpace': 'pre-wrap', 'lineHeight': '1.6', 'fontSize': '0.95rem',
+                        'color': '#f0f6fc'
+                    }),
+                    html.Hr(),
+                    html.Small(
+                        f"Erstellt mit Groq ({MODEL}) · Gleicher Prompt wie Naive-LLM, zusätzlich "
+                        f"{len(retrieved)} abgerufene Nachrichten-Snippets als Kontext.",
+                        className="text-muted"
+                    )
+                ])], className="card-custom mt-3")
             ]
 
-            for i, chunk in enumerate(retrieved, 1):
-                metadata = chunk.get('metadata', {})
-                result_components.append(
-                    dbc.Card([
-                        dbc.CardBody([
-                            dbc.Row([
-                                dbc.Col([html.H6(f"[{i}] {metadata.get('ticker', 'N/A')} - {metadata.get('title', 'N/A')[:60]}",
-                                                style={'color': '#58a6ff'})], width=9),
-                                dbc.Col([html.Small(metadata.get('source', 'Unknown'), className="text-muted")], width=3)
-                            ]),
-                            html.P(chunk.get('text', '')[:200] + "...",
-                                  className="text-muted small", style={'marginTop': '10px', 'marginBottom': '10px'}),
-                            html.A("📌 Link zur Nachricht", href=metadata.get('link', '#'), target="_blank",
-                                  className="small", style={'color': '#79c0ff', 'textDecoration': 'underline'})
+            # Quellen (Top-K)
+            if retrieved:
+                components.append(html.H5("📰 Verwendete Quellen", style={
+                    'color': '#79c0ff', 'marginTop': '20px', 'marginBottom': '10px'}))
+                for i, chunk in enumerate(retrieved, 1):
+                    md = chunk.get('metadata', {})
+                    not_dated = md.get('date_filtered') is False
+                    components.append(dbc.Card([dbc.CardBody([
+                        dbc.Row([
+                            dbc.Col([html.H6(f"[{i}] {md.get('ticker', 'N/A')} - {md.get('title', 'N/A')[:60]}",
+                                             style={'color': '#58a6ff'})], width=9),
+                            dbc.Col([
+                                html.Small(md.get('source', 'Unknown'), className="text-muted d-block"),
+                                html.Small(md.get('published', '')[:10], className="text-muted")
+                            ], width=3)
+                        ]),
+                        html.P(chunk.get('text', '')[:200] + "...",
+                               className="text-muted small", style={'marginTop': '10px', 'marginBottom': '10px'}),
+                        html.Div([
+                            html.A("📌 Link zur Nachricht", href=md.get('link', '#'), target="_blank",
+                                   className="small", style={'color': '#79c0ff', 'textDecoration': 'underline'}),
+                            html.Span(" · Kontext nicht aus dem Anomaliefenster (Fallback)",
+                                      className="small text-warning") if not_dated else None,
                         ])
-                    ], className="card-custom", style={'marginBottom': '10px'})
-                )
+                    ])], className="card-custom", style={'marginBottom': '10px'}))
 
-            return html.Div(result_components)
+            return html.Div(components)
 
         except Exception as e:
-            logger.error(f"Error in RAG query: {e}")
+            logger.error(f"Error in RAG analysis: {e}")
             import traceback
             traceback.print_exc()
             return dbc.Alert([
-                html.H5("❌ Fehler bei RAG-Abfrage"),
-                html.P(f"Fehler: {str(e)}")
+                html.H5("Fehler bei der RAG-Analyse", className="mb-2"),
+                html.P(f"Fehlerdetails: {str(e)}"),
             ], color="danger")
+
+    @app.callback(
+        Output('collapse-rag-prompt', 'is_open'),
+        Output('rag-prompt-container', 'children'),
+        Input('btn-toggle-rag-prompt', 'n_clicks'),
+        State('collapse-rag-prompt', 'is_open'),
+        State('analysis-data', 'data'),
+        prevent_initial_call=True,
+    )
+    def toggle_rag_prompt(n_clicks, is_open, analysis_data):
+        """Zeigt den EXAKTEN Prompt, der an das LLM geht — inkl. abgerufenem Nachrichten-Kontext."""
+        if is_open:
+            return False, no_update  # Schließen: nicht neu berechnen/abrufen
+        if not analysis_data or not analysis_data.get('positions'):
+            return True, dbc.Alert("Keine Portfolio-Daten verfügbar.", color="warning")
+
+        rag_pipeline = rag_provider.get()
+        if not rag_pipeline:
+            prompt = build_portfolio_prompt(analysis_data)
+            return True, html.Pre(
+                prompt + "\n\n[RAG nicht verfügbar — Nachrichten-Kontext fehlt]",
+                style=PROMPT_DEBUG_STYLE)
+
+        with _rag_lock:
+            _index_anomaly_news(rag_pipeline, analysis_data)
+            context, _ = _collect_rag_context(rag_pipeline, analysis_data)
+
+        prompt = build_portfolio_prompt(analysis_data, news_context=context or None)
+        return True, html.Pre(prompt, style=PROMPT_DEBUG_STYLE)
+
+    @app.callback(
+        Output('collapse-rag-news', 'is_open'),
+        Output('rag-news-table-container', 'children'),
+        Input('btn-rag-toggle-news', 'n_clicks'),
+        State('collapse-rag-news', 'is_open'),
+        prevent_initial_call=True,
+    )
+    def toggle_news_table(n_clicks, is_open):
+        rag_pipeline = rag_provider.get()
+        if not rag_pipeline:
+            return (not is_open), dbc.Alert("RAG Pipeline nicht verfügbar", color="warning")
+
+        articles = rag_pipeline.cache.all_articles(limit=200)
+        if not articles:
+            content = dbc.Alert("Noch keine Nachrichten im Cache. Klicke zuerst auf 'Mit RAG analysieren'.",
+                                color="info")
+        else:
+            df = pd.DataFrame(articles)
+            out = pd.DataFrame({
+                'ticker': df['ticker'],
+                'published': df['published'].apply(lambda x: str(x)[:10] if x else '—'),
+                'title': df['title'].apply(lambda x: (x or '')[:80]),
+                'source': df['source'],
+                'indexed': df['indexed'].apply(lambda x: '✓' if x else '—'),
+            })
+            out.insert(0, '#', range(1, len(out) + 1))
+            out.columns = NEWS_TABLE_HEADERS
+            content = dbc.Table.from_dataframe(
+                out, striped=True, bordered=True, hover=True, responsive=True, className="mt-2")
+
+        return (not is_open), content

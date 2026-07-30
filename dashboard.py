@@ -9,42 +9,23 @@ if sys.stderr.encoding != 'utf-8':
     sys.stderr.reconfigure(encoding='utf-8', errors='replace')
 
 import logging
-import threading
 from dotenv import load_dotenv
 
 import dash
 import dash_bootstrap_components as dbc
 from dash import dcc, html
 
-# RAG deaktiviert — bei Bedarf wieder einkommentieren
-# try:
-#     from rag.pipeline import RAGPipeline
-#     RAG_AVAILABLE = True
-# except Exception as e:
-#     print(f"Warning: RAG modules not available: {e}")
-#     RAG_AVAILABLE = False
-RAG_AVAILABLE = False
-
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 load_dotenv()
 
-# --- RAG init (deaktiviert) ---
-rag_pipeline = None
-
-# Bei Bedarf wieder einkommentieren:
-# def _init_rag_background():
-#     global rag_pipeline, RAG_AVAILABLE
-#     try:
-#         persist_dir = os.path.join(os.getcwd(), "data", "faiss")
-#         rag_pipeline = RAGPipeline(persist_dir=persist_dir)
-#         logger.info("RAG Pipeline initialized successfully")
-#     except Exception as e:
-#         logger.warning(f"Failed to initialize RAG pipeline: {e}")
-#         RAG_AVAILABLE = False
-#
-# if RAG_AVAILABLE:
-#     threading.Thread(target=_init_rag_background, daemon=True).start()
+# --- RAG (lazy) ---
+# RAG wird NICHT beim Start geladen, sondern erst beim ersten Gebrauch im RAG-Tab
+# (via RAGProvider.get()). Der Provider selbst ist billig und lädt weder torch noch
+# das Embedding-Modell. So starten App, Ticker, Anomalie-Erkennung und Naive-LLM ohne
+# Verzögerung; das schwere RAG-Laden passiert erst, wenn RAG tatsächlich benutzt wird.
+from rag.provider import RAGProvider
+rag_provider = RAGProvider()
 
 import auto_load
 from utils.finance import fetch_price_at_date
@@ -260,6 +241,17 @@ app.layout = html.Div([
                                 )
                             ])
                         ]),
+                        dbc.Row([
+                            dbc.Col([
+                                dbc.Button("Prompt anzeigen (vorübergehend/Debug)", id="btn-toggle-naive-prompt",
+                                          color="secondary", className="btn-custom mb-3"),
+                                dbc.Collapse(
+                                    html.Div(id="naive-prompt-container"),
+                                    id="collapse-naive-prompt",
+                                    is_open=False,
+                                )
+                            ])
+                        ]),
                     ])
                 ]),
 
@@ -268,39 +260,38 @@ app.layout = html.Div([
                         dbc.Row([
                             dbc.Col([
                                 dbc.Card([
-                                    dbc.CardHeader("Yahoo Finance Nachrichten - RAG", className="card-header-custom"),
+                                    dbc.CardHeader("AI-gestützte Portfolio-Analyse (RAG)", className="card-header-custom"),
                                     dbc.CardBody([
-                                        html.P("Holen Sie sich die neuesten Nachrichten von Yahoo Finance und stellen Sie Fragen mit RAG-gestützter Kontextanalyse.", className="text-muted mb-3"),
-
-                                        html.Div([
-                                            html.H5("1. Nachrichten indizieren", style={'fontSize': '1.1rem', 'fontWeight': '600'}),
-                                            dbc.Row([
-                                                dbc.Col([dbc.Label("Ticker (komma-getrennt)"), dbc.Input(id="rag-ticker-input", placeholder="z.B. AAPL,MSFT,TSLA", type="text", value="AAPL,MSFT,TSLA")], width=8),
-                                                dbc.Col([dbc.Label("Pro Ticker:"), dbc.Input(id="rag-limit-input", placeholder="5", type="number", value=5, min=1, max=20)], width=4)
-                                            ]),
-                                            dbc.Button("Nachrichten abrufen & indizieren", id="btn-rag-fetch", color="primary", className="btn-custom mb-3", style={'marginTop': '10px'}),
-                                            html.Div(id="rag-fetch-status", className="mb-3"),
-                                        ], className="mb-4", style={'padding': '15px', 'border': '1px solid #30363d', 'borderRadius': '4px'}),
-
-                                        html.Div([
-                                            html.H5("2. Nachrichten durchsuchen & Fragen beantworten", style={'fontSize': '1.1rem', 'fontWeight': '600'}),
-                                            dbc.Row([
-                                                dbc.Col([dbc.Label("Frage eingeben:"), dbc.Input(id="rag-query-input", placeholder="z.B. Was sind die neuesten Nachrichten über Apple?", type="text")], width=8),
-                                                dbc.Col([dbc.Label("Top-K Ergebnisse:"), dbc.Input(id="rag-topk-input", placeholder="5", type="number", value=5, min=1, max=20)], width=4)
-                                            ]),
-                                            dbc.Button("Mit RAG abfragen", id="btn-rag-query", color="success", className="btn-custom mb-3", style={'marginTop': '10px'}),
-                                            html.Div(id="rag-query-status", className="mb-3"),
-                                        ], className="mb-3", style={'padding': '15px', 'border': '1px solid #30363d', 'borderRadius': '4px'}),
-
-                                        html.Div([
-                                            html.H5("RAG Ergebnisse", style={'fontSize': '1.1rem', 'fontWeight': '600', 'marginTop': '20px'}),
-                                            dcc.Loading(id="loading-rag", type="default",
-                                                       children=html.Div(id="rag-results-output", style={'whiteSpace': 'pre-wrap', 'minHeight': '100px'}))
-                                        ], style={'marginTop': '20px'})
+                                        html.P("Gleiche Analyse wie im Naive-LLM-Tab, jedoch mit abgerufenem Nachrichten-Kontext (RAG). Der Prompt ist identisch — so wird der Effekt des Retrievals sichtbar.", className="text-muted mb-3"),
+                                        dbc.Button("Mit RAG analysieren", id="btn-rag-analyze", color="primary", className="btn-custom mb-3", size="lg"),
+                                        dcc.Loading(id="loading-rag", type="default",
+                                                   children=html.Div(id="rag-llm-output", style={'whiteSpace': 'pre-wrap'}))
                                     ])
                                 ], className="card-custom")
                             ])
                         ], className="mt-4"),
+                        dbc.Row([
+                            dbc.Col([
+                                dbc.Button("Abgerufene Nachrichten anzeigen (vorübergehend/Debug)", id="btn-rag-toggle-news",
+                                          color="secondary", className="btn-custom mb-3"),
+                                dbc.Collapse(
+                                    html.Div(id="rag-news-table-container"),
+                                    id="collapse-rag-news",
+                                    is_open=False,
+                                )
+                            ])
+                        ]),
+                        dbc.Row([
+                            dbc.Col([
+                                dbc.Button("Prompt anzeigen (vorübergehend/Debug)", id="btn-toggle-rag-prompt",
+                                          color="secondary", className="btn-custom mb-3"),
+                                dbc.Collapse(
+                                    html.Div(id="rag-prompt-container"),
+                                    id="collapse-rag-prompt",
+                                    is_open=False,
+                                )
+                            ])
+                        ]),
                     ])
                 ]),
             ], id="tabs", active_tab="tab-overview"),
@@ -316,7 +307,7 @@ app.layout = html.Div([
 # Register callbacks
 from callbacks import register_all
 
-register_all(app, rag_pipeline)
+register_all(app, rag_provider)
 
 if __name__ == '__main__':
     app.run(debug=True, port=8050)

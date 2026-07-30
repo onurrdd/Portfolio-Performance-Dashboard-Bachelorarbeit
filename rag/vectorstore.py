@@ -69,6 +69,7 @@ class FAISSVectorStore:
                 "ticker": chunk.get("ticker", ""),
                 "link": chunk.get("link", ""),
                 "published": chunk.get("published", ""),
+                "published_epoch": chunk.get("published_epoch", 0),
                 "source": chunk.get("source", ""),
                 "chunk_index": chunk.get("chunk_index", 0),
             })

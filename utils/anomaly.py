@@ -92,38 +92,43 @@ def _cheap_filter_flags(day, positions, price_df):
 def _ticker_attribution(day, surprise_value, positions, price_df, ticker_returns_df):
     """Vorzeichentreue Ticker-Zuordnung + Konzentrationsmaß."""
     if day not in price_df.index:
-        return None, 0.0, None
+        return None, 0.0, None, None
     active = _active_positions_on(positions, day, price_df)
     if not active:
-        return None, 0.0, None
+        return None, 0.0, None, None
     values = {p['ticker']: p['shares'] * price_df.loc[day, p['ticker']] for p in active}
     total_value = sum(values.values())
     if total_value <= 0:
-        return None, 0.0, None
+        return None, 0.0, None, None
 
     contributions = {}
+    own_returns = {}
     for p in active:
         t = p['ticker']
         r = ticker_returns_df.loc[day, t] if (day in ticker_returns_df.index and t in ticker_returns_df.columns) else np.nan
         if pd.isna(r):
             continue
         contributions[t] = (values[t] / total_value) * r
+        own_returns[t] = r
     if not contributions:
-        return None, 0.0, None
+        return None, 0.0, None, None
 
     # Nur Beiträge in Richtung des Surprise-Vorzeichens sind mögliche "Verursacher".
     sign = 1 if surprise_value >= 0 else -1
     same_dir = {t: c for t, c in contributions.items() if (c >= 0) == (sign >= 0) and c != 0}
     if not same_dir:
         # Kein Titel bewegt sich in Surprise-Richtung → nicht einem Titel zuschreibbar.
-        return None, 0.0, None
+        return None, 0.0, None, None
 
     top_ticker = max(same_dir, key=lambda t: abs(same_dir[t]))
     top_value = same_dir[top_ticker]
     denom = sum(abs(c) for c in same_dir.values())
     concentration_ratio = abs(top_value) / denom if denom > 0 else 0
     concentration = 'Hisseye özgü' if concentration_ratio > _CONCENTRATION_CUTOFF else 'Faktör/Sektör'
-    return top_ticker, float(top_value * 100), concentration
+    # Eigene (ungewichtete) Tagesrendite des Tickers — wichtig für "warum ist X um Y% gestiegen"-Fragen,
+    # da der gewichtete Portfolio-Beitrag (top_value) durch die Portfoliogewichtung verwässert ist.
+    own_return_pct = float(own_returns[top_ticker] * 100)
+    return top_ticker, float(top_value * 100), concentration, own_return_pct
 
 
 def detect_anomalies(portfolio_returns, benchmark_returns, positions, price_df,
@@ -153,7 +158,7 @@ def detect_anomalies(portfolio_returns, benchmark_returns, positions, price_df,
             continue
         b_z = benchmark_z.loc[day]
         classification = 'Kopma' if (pd.notna(b_z) and abs(b_z) > threshold) else 'Portföye özgü'
-        responsible_ticker, ticker_contribution_pct, concentration = _ticker_attribution(
+        responsible_ticker, ticker_contribution_pct, concentration, ticker_own_return_pct = _ticker_attribution(
             day, s_val, positions, price_df, ticker_returns_df
         )
         results.append({
@@ -168,6 +173,7 @@ def detect_anomalies(portfolio_returns, benchmark_returns, positions, price_df,
             'classification': classification,
             'responsible_ticker': responsible_ticker,
             'ticker_contribution_pct': ticker_contribution_pct,
+            'ticker_own_return_pct': ticker_own_return_pct,
             'concentration': concentration,
             'flags': _cheap_filter_flags(day, positions, price_df),
         })

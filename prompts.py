@@ -1,26 +1,32 @@
 import json
 
-ADVISOR_PROMPT_TEMPLATE = """Sen bir portföy danışmanısın. Verilen bilgiler ışığında soruları yanıtla.
+# Sprache der LLM-ANTWORT: "de", "en" oder "tr".
+# Die Prompts selbst sind IMMER Englisch (Projektregel, siehe CLAUDE.md).
+RESPONSE_LANGUAGE = "tr"
 
-Mevcut portföyün başarısını verilen bilgiler ışığında değerlendir. Net yanıtlar ver.
+# "en" fehlt bewusst: der Prompt ist bereits Englisch, eine Extra-Anweisung wäre redundant.
+RESPONSE_LANGUAGE_INSTRUCTIONS = {
+    "de": "\n\nPlease respond in German.",
+    "tr": "\n\nPlease respond in Turkish.",
+}
 
-Bilgi: Portföyün ve SP500 Index'inin
+ADVISOR_PROMPT_TEMPLATE = """You are a portfolio advisor. Answer the questions based on the information provided.
 
-getiri oranı
-Sharpe Ratiosu
+Evaluate the current portfolio's performance in light of the information given. Provide clear, concrete answers.
+
+Information: Return and Sharpe ratio of the portfolio and of the S&P 500 index
 
 {performance_info}
 
-Başarının veya başarısızlığın
-Finansal piyasa sebepleri nelerdir?
-Sonuç hangi tickerardan kaynaklanmaktadır? Bu tickerlardaki performans sapmalarının sebepleri nelerdir?
-Sebep olarak sunduğun bilgiler için kaynak ver.
+What are the financial market reasons for this success or underperformance?
+Which tickers is the result driven by? What are the reasons for the performance deviations in those tickers?
+Cite sources for the reasons you present.
 
-Bilgi: Portföyün Sp500'den saptığı noktalar. O noktaların sebebi olan ticker'lar ve sapma noktasından önceki ve sonraki fiyatları
+Information: Points where the portfolio deviated from the S&P 500, the tickers responsible for those deviations, and their prices before and after the deviation
 
 {deviation_info}"""
 
-_MISSING_INFO_PLACEHOLDER = "(henüz sağlanmadı)"
+_MISSING_INFO_PLACEHOLDER = "(not provided yet)"
 
 
 def _format_info(info):
@@ -37,6 +43,7 @@ def performance_info_from_analysis_data(analysis_data):
 
     metrics = analysis_data.get('metrics', {})
     rolling_sharpe = analysis_data.get('rolling_sharpe', {})
+    benchmark = analysis_data.get('benchmark', {})
 
     return {
         'portfolio': {
@@ -45,8 +52,8 @@ def performance_info_from_analysis_data(analysis_data):
             'sharpe_ratio': rolling_sharpe.get('current'),
         },
         'sp500': {
-            'total_return_pct': None,
-            'sharpe_ratio': None,
+            'total_return_pct': benchmark.get('total_return'),
+            'sharpe_ratio': benchmark.get('sharpe_current'),
         },
     }
 
@@ -58,9 +65,12 @@ def build_advisor_prompt(performance_info=None, deviation_info=None, news_contex
     )
 
     if news_context is not None:
-        prompt += f"\n\nZusätzlicher Kontext (Nachrichten):\n{_format_info(news_context)}"
+        prompt += f"\n\nAdditional context (news):\n{_format_info(news_context)}"
 
     if user_question is not None:
-        prompt += f"\n\nBenutzerfrage: {user_question}"
+        prompt += f"\n\nUser question: {user_question}"
+
+    if RESPONSE_LANGUAGE in RESPONSE_LANGUAGE_INSTRUCTIONS:
+        prompt += RESPONSE_LANGUAGE_INSTRUCTIONS[RESPONSE_LANGUAGE]
 
     return prompt

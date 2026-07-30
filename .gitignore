@@ -22,6 +22,11 @@ Thumbs.db
 data/processed/
 data/faiss/
 data/chroma/
+data/news_cache.db
 
 # Claude Code interne Einstellungen
 .claude/
+
+# Bachelorarbeit-Arbeitsnotizen (nicht Teil des Codes)
+implementierung_schritte.md
+theoretische_grundlagen.md
