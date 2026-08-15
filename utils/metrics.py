@@ -1,6 +1,8 @@
 import numpy as np
 import pandas as pd
 
+from utils.finance import adjust_shares_for_splits
+
 
 def calculate_sortino_ratio(returns, risk_free_rate=0.02):
     excess_returns = returns - risk_free_rate / 252
@@ -42,6 +44,15 @@ def calculate_twr_metrics(positions, price_df):
     positions_sorted = sorted(positions, key=lambda x: pd.to_datetime(x['buy_date']))
     buy_dates = [pd.to_datetime(p['buy_date']) for p in positions_sorted]
 
+    # Split-bereinigte Stückzahl je Position (einmalig): price_df-Kurse sind
+    # split-adjustiert (yfinance-Standard), rohe p['shares'] wäre sonst um den
+    # Split-Faktor falsch skaliert — derselbe Fehler wie in utils/finance.py
+    # (calculate_portfolio_timeseries) und utils/anomaly.py (_ticker_attribution).
+    adjusted_shares = {
+        id(p): adjust_shares_for_splits(p['ticker'], p['shares'], p['buy_date'])
+        for p in positions_sorted
+    }
+
     if not price_df.empty and price_df.index.tz is not None:
         tz = price_df.index.tz
         buy_dates = [
@@ -81,7 +92,7 @@ def calculate_twr_metrics(positions, price_df):
         period_dates_valid = []
         for date in period_dates:
             value = sum(
-                p['shares'] * price_df.loc[date, p['ticker']]
+                adjusted_shares[id(p)] * price_df.loc[date, p['ticker']]
                 for p in active_positions
                 if p['ticker'] in price_df.columns
             )

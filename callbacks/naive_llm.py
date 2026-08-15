@@ -6,12 +6,15 @@ from dash import Input, Output, State, html, no_update
 
 # Sprache der LLM-ANTWORT: "de", "en" oder "tr".
 # Die Prompts selbst sind IMMER Englisch (Projektregel, siehe CLAUDE.md).
-RESPONSE_LANGUAGE = "tr"
+RESPONSE_LANGUAGE = "en"
 
-PROMPT_TEMPLATE = """Analyze the portfolio below and give me professional feedback.
-Answer the following two parts separately, using "PART 1" and "PART 2" as headings.
+# Flag: Teil 1 (Performance vs. Benchmark) temporär deaktiviert — Forschungsfrage fokussiert
+# jetzt auf die kausale Erklärung von Anomalie-Ereignissen (Teil 2), nicht mehr auf die
+# Interpretation von Kennzahlen. Code bewusst NICHT gelöscht, um Teil 1 bei Bedarf wieder
+# zu aktivieren (True setzen).
+INCLUDE_METRICS_PART = False
 
-=== PART 1: PERFORMANCE VS. BENCHMARK ===
+PART1_TEMPLATE = """=== PART 1: PERFORMANCE VS. BENCHMARK ===
 
 PERFORMANCE METRICS:
 - Total Return: {total_return:.2f}%
@@ -32,7 +35,9 @@ Then explain why the portfolio's performance is better or worse than the S&P 500
 benchmark shown above (e.g. sector/stock exposure, timing of purchases,
 diversification, or general market conditions).
 
-=== PART 2: SINGLE-STOCK ANOMALY EVENTS ===
+"""
+
+PART2_TEMPLATE = """=== PART 2: SINGLE-STOCK ANOMALY EVENTS ===
 
 Below is a list of single-stock anomaly events detected in this portfolio. Each event is a case where a specific stock showed an unusually large price move on a specific date — large both relative to its own historical volatility and relative to how the market moved that day.
 
@@ -40,15 +45,28 @@ ANOMALY EVENTS:
 {anomaly_list}
 
 For each event listed above, explain the reason for this price move on that
-specific date (or the previous trading day, since news can affect prices with a one-day lag).
+specific date.
 Address every event individually; do not summarize them collectively.
 
-Give a specific, concrete, and definitive answer for each event — name the actual cause
-(for example the exact earnings result, a product or announcement, an analyst rating action,
-regulatory or legal news, M&A, or a specific macroeconomic event). Do NOT give generic or
-vague explanations, and do NOT hedge with words like "possibly", "maybe", "could be", "might",
-"likely", or "perhaps". Commit to a direct answer.
+For each explanation, also state what you are basing it on (e.g. a specific news report,
+earnings release, or your own general knowledge of the event) — name the source if you are
+citing one.
+
 """
+# (or the previous trading day, since news can affect prices with a one-day lag)
+# Give a specific, concrete, and definitive answer for each event. Do NOT give generic or
+# vague explanations. Commit to a direct answer.
+if INCLUDE_METRICS_PART:
+    PROMPT_TEMPLATE = (
+        'Analyze the portfolio below and give me professional feedback.\n'
+        'Answer the following two parts separately, using "PART 1" and "PART 2" as headings.\n\n'
+        + PART1_TEMPLATE + PART2_TEMPLATE
+    )
+else:
+    PROMPT_TEMPLATE = (
+        'Analyze the portfolio below and give me professional feedback.\n\n'
+        + PART2_TEMPLATE
+    )
 
 # "en" fehlt bewusst: der Prompt ist bereits Englisch, eine Extra-Anweisung wäre redundant.
 RESPONSE_LANGUAGE_INSTRUCTIONS = {
@@ -70,9 +88,11 @@ TABLE_LANGUAGE = "de"
 
 TABLE_HEADERS = {
     "tr": ['#', 'Tarih', 'Gerçekleşen', 'Beklenen', 'Sürpriz', 'Sürpriz (MAD-z)',
-           'Benchmark (MAD-z)', 'β', 'Sorumlu Ticker', 'Hisse Getirisi', 'Uyarı'],
+           'Benchmark (MAD-z)', 'β', 'Sorumlu Ticker', 'Hisse Getirisi',
+           'Hisse Sürprizi', 'Hisse (MAD-z)', 'Uyarı'],
     "de": ['#', 'Datum', 'Tatsächlich', 'Erwartet', 'Überraschung', 'Überraschung (MAD-z)',
-           'Benchmark (MAD-z)', 'β', 'Verantwortlicher Ticker', 'Titel-Rendite', 'Warnung'],
+           'Benchmark (MAD-z)', 'β', 'Verantwortlicher Ticker', 'Titel-Rendite',
+           'Titel-Residuum', 'Titel (MAD-z)', 'Warnung'],
 }
 
 CONCENTRATION_LABELS = {
@@ -130,8 +150,9 @@ def build_portfolio_prompt(analysis_data, news_context=None):
         prompt += (
             "\n\n=== RETRIEVED NEWS CONTEXT (RAG) ===\n"
             "The following news items were retrieved for the anomaly tickers and dates. "
-            "Use them as evidence when explaining the anomaly events above, and cite the "
-            "source when you rely on one.\n"
+            "Only use a retrieved item if it is genuinely relevant to explaining a specific "
+            "event. If none of the retrieved items are relevant to a given event, say so "
+            "explicitly instead of forcing a connection.\n"
             f"{news_context}"
         )
     if ANOMALY_PROMPT_SAFE_MODE:
@@ -150,6 +171,74 @@ PROMPT_DEBUG_STYLE = {
 }
 
 
+def _run_naive_analysis(analysis_data):
+    """Führt die Naive-LLM-Analyse aus und baut die Ergebniskarte.
+
+    Gemeinsame Logik für den Naive-LLM-Tab UND den Vergleichs-Tab (ein Trigger-Button
+    löst dort beide Analysen aus) — identischer Code, ein einziger Ort zum Pflegen.
+    """
+    if not analysis_data or not analysis_data.get('positions'):
+        return dbc.Alert("Keine Portfolio-Daten verfügbar. Bitte füge zuerst Positionen hinzu.", color="warning")
+
+    try:
+        client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
+        # Identischer Prompt wie im RAG-Tab (build_portfolio_prompt) — hier ohne
+        # Nachrichten-Kontext (naiv). So ist der einzige Unterschied das Retrieval.
+        prompt = build_portfolio_prompt(analysis_data)
+
+        response = client.chat.completions.create(
+            messages=[{"role": "user", "content": prompt}],
+            model="llama-3.3-70b-versatile",
+            max_tokens=4096,
+        )
+        analysis_text = response.choices[0].message.content
+
+        return dbc.Card([
+            dbc.CardBody([
+                html.H5("AI Feedback zu deinen Metriken", className="mb-3", style={'color': '#f0f6fc'}),
+                html.Div(analysis_text, id="ai-text-content", style={
+                    'whiteSpace': 'pre-wrap',
+                    'lineHeight': '1.6',
+                    'fontSize': '0.95rem',
+                    'color': '#f0f6fc'
+                }),
+                html.Hr(),
+                html.Small(
+                    "Erstellt mit Groq · Hinweis: Dieses Modell hat keinen Zugriff auf aktuelle "
+                    "Nachrichten (kein RAG) — die Antworten zu den Anomalietagen basieren "
+                    "ausschließlich auf dem allgemeinen Trainingswissen des Modells und sind "
+                    "keine verifizierte Quelle.",
+                    className="text-muted"
+                )
+            ])
+        ], className="card-custom mt-3")
+
+    except Exception as e:
+        return dbc.Alert([
+            html.H5("Fehler bei der AI-Analyse", className="mb-2"),
+            html.P(f"Fehlerdetails: {str(e)}"),
+            html.Hr(),
+            html.Small(["Mögliche Ursachen:", html.Ul([
+                html.Li("GROQ_API_KEY nicht gesetzt"),
+                html.Li("Ungültiger API-Schlüssel"),
+                html.Li("Netzwerkprobleme"),
+                html.Li("API-Rate-Limit erreicht")
+            ])])
+        ], color="danger")
+
+
+def _naive_prompt_component(analysis_data):
+    """Baut die Debug-Anzeige des exakten Naive-LLM-Prompts (ohne Nachrichten-Kontext).
+
+    Gemeinsame Logik für den 'Prompt anzeigen'-Button im Naive-LLM-Tab UND im
+    Vergleichs-Tab.
+    """
+    if not analysis_data or not analysis_data.get('positions'):
+        return dbc.Alert("Keine Portfolio-Daten verfügbar.", color="warning")
+    prompt = build_portfolio_prompt(analysis_data)
+    return html.Pre(prompt, style=PROMPT_DEBUG_STYLE)
+
+
 def register(app):
     @app.callback(
         Output('naive-llm-output', 'children'),
@@ -159,55 +248,20 @@ def register(app):
     def analyze_portfolio_with_ai(n_clicks, analysis_data):
         if not n_clicks:
             return ""
+        return _run_naive_analysis(analysis_data)
 
-        if not analysis_data or not analysis_data.get('positions'):
-            return dbc.Alert("Keine Portfolio-Daten verfügbar. Bitte füge zuerst Positionen hinzu.", color="warning")
-
-        try:
-            client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
-            # Identischer Prompt wie im RAG-Tab (build_portfolio_prompt) — hier ohne
-            # Nachrichten-Kontext (naiv). So ist der einzige Unterschied das Retrieval.
-            prompt = build_portfolio_prompt(analysis_data)
-
-            response = client.chat.completions.create(
-                messages=[{"role": "user", "content": prompt}],
-                model="llama-3.3-70b-versatile",
-                max_tokens=4096,
-            )
-            analysis_text = response.choices[0].message.content
-
-            return dbc.Card([
-                dbc.CardBody([
-                    html.H5("AI Feedback zu deinen Metriken", className="mb-3", style={'color': '#f0f6fc'}),
-                    html.Div(analysis_text, id="ai-text-content", style={
-                        'whiteSpace': 'pre-wrap',
-                        'lineHeight': '1.6',
-                        'fontSize': '0.95rem',
-                        'color': '#f0f6fc'
-                    }),
-                    html.Hr(),
-                    html.Small(
-                        "Erstellt mit Groq · Hinweis: Dieses Modell hat keinen Zugriff auf aktuelle "
-                        "Nachrichten (kein RAG) — die Antworten zu den Anomalietagen basieren "
-                        "ausschließlich auf dem allgemeinen Trainingswissen des Modells und sind "
-                        "keine verifizierte Quelle.",
-                        className="text-muted"
-                    )
-                ])
-            ], className="card-custom mt-3")
-
-        except Exception as e:
-            return dbc.Alert([
-                html.H5("Fehler bei der AI-Analyse", className="mb-2"),
-                html.P(f"Fehlerdetails: {str(e)}"),
-                html.Hr(),
-                html.Small(["Mögliche Ursachen:", html.Ul([
-                    html.Li("GROQ_API_KEY nicht gesetzt"),
-                    html.Li("Ungültiger API-Schlüssel"),
-                    html.Li("Netzwerkprobleme"),
-                    html.Li("API-Rate-Limit erreicht")
-                ])])
-            ], color="danger")
+    @app.callback(
+        Output('compare-naive-output', 'children'),
+        Input('btn-compare-analyze', 'n_clicks'),
+        State('analysis-data', 'data'),
+        prevent_initial_call=True,
+    )
+    def analyze_naive_compare(n_clicks, analysis_data):
+        """Vergleichs-Tab, linke Seite — identische Logik wie der Naive-LLM-Tab,
+        ausgelöst vom gemeinsamen 'btn-compare-analyze'-Button."""
+        if not n_clicks:
+            return ""
+        return _run_naive_analysis(analysis_data)
 
     @app.callback(
         Output('collapse-breaks', 'is_open'),
@@ -229,10 +283,10 @@ def register(app):
             df = pd.DataFrame(breaks)
 
             def _ticker_cell(row):
-                if not row['responsible_ticker']:
+                if pd.isna(row['responsible_ticker']):
                     return text["not_attributable"]
                 conc = row.get('concentration')
-                conc_label = f" · {conc_labels.get(conc, conc)}" if conc else ""
+                conc_label = f" · {conc_labels.get(conc, conc)}" if pd.notna(conc) else ""
                 return f"{row['responsible_ticker']} ({row['ticker_contribution_pct']:+.2f}%){conc_label}"
 
             out = pd.DataFrame({
@@ -246,6 +300,10 @@ def register(app):
                 'ticker': df.apply(_ticker_cell, axis=1),
                 'own_return': df['ticker_own_return_pct'].apply(
                     lambda x: f"{x:+.2f}%" if pd.notna(x) else text["dash"]),
+                'own_residual': df['ticker_own_residual_pct'].apply(
+                    lambda x: f"{x:+.2f}%" if pd.notna(x) else text["dash"]),
+                'own_z': df['ticker_own_mad_z'].apply(
+                    lambda x: f"{x:+.2f}" if pd.notna(x) else text["dash"]),
                 'flags': df['flags'].apply(lambda x: x if x else text["dash"]),
             })
             out.insert(0, '#', range(1, len(out) + 1))
@@ -268,7 +326,18 @@ def register(app):
         """Zeigt den EXAKTEN Prompt, der an das LLM geht (ohne Nachrichten-Kontext)."""
         if is_open:
             return False, no_update  # Schließen: nicht neu berechnen
-        if not analysis_data or not analysis_data.get('positions'):
-            return True, dbc.Alert("Keine Portfolio-Daten verfügbar.", color="warning")
-        prompt = build_portfolio_prompt(analysis_data)
-        return True, html.Pre(prompt, style=PROMPT_DEBUG_STYLE)
+        return True, _naive_prompt_component(analysis_data)
+
+    @app.callback(
+        Output('collapse-compare-naive-prompt', 'is_open'),
+        Output('compare-naive-prompt-container', 'children'),
+        Input('btn-toggle-compare-naive-prompt', 'n_clicks'),
+        State('collapse-compare-naive-prompt', 'is_open'),
+        State('analysis-data', 'data'),
+        prevent_initial_call=True,
+    )
+    def toggle_compare_naive_prompt(n_clicks, is_open, analysis_data):
+        """Vergleichs-Tab, linke Seite — gleicher 'Prompt anzeigen' wie im Naive-LLM-Tab."""
+        if is_open:
+            return False, no_update
+        return True, _naive_prompt_component(analysis_data)

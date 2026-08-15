@@ -65,43 +65,70 @@ class RAGPipeline:
         successful_tickers = 0
         skipped_tickers = 0
 
+        win_start = target_day - timedelta(days=window)
+        win_end = target_day + timedelta(days=window)
+
+        # Quellen ohne Historie (supports_date_range = False, z. B. reines RSS) können
+        # NUR etwas beitragen, wenn das Fenster die Gegenwart enthält — sonst liefern sie
+        # zwangsläufig aktuelle Artikel, die der Fenster-Filter unten wieder verwirft.
+        # Solche Quellen werden bei historischen Fenstern gar nicht erst angefragt
+        # (spart je Anomalie und Ticker einen nutzlosen Netz-Request).
+        window_covers_now = win_start <= datetime.now() <= win_end
+        usable_sources = [
+            s for s in self.sources
+            # Default True: eine Quelle, die das Attribut nicht deklariert, wird wie bisher
+            # immer angefragt — lieber ein überflüssiger Request als stilles Datenverlieren.
+            if window_covers_now or getattr(s, "supports_date_range", True)
+        ]
+        if len(usable_sources) < len(self.sources):
+            skipped = [getattr(s, "name", "?") for s in self.sources if s not in usable_sources]
+            logger.info(f"Historisches Fenster ({win_start.date()}…{win_end.date()}): "
+                        f"Quelle(n) ohne Zeitraum-Unterstützung übersprungen: {skipped}")
+
         for ticker in tickers:
             if self.cache.has_coverage(ticker, target_day, window):
                 skipped_tickers += 1
                 logger.info(f"{ticker}: bereits abgedeckt (±{window}d um {target_day.date()}) — kein Fetch")
                 continue
 
-            articles = []
-            for src in self.sources:
+            raw_articles = []
+            for src in usable_sources:
                 try:
-                    articles.extend(src.fetch(ticker, news_limit))
+                    # start/end übergeben: quellenspezifisch — tageshistorische Quellen
+                    # (SEC EDGAR, Alpha Vantage) nutzen das Fenster gezielt; reine
+                    # RSS-Feeds ohne Historie ignorieren es (liefern nur Aktuelles).
+                    raw_articles.extend(src.fetch(ticker, news_limit, start=win_start, end=win_end))
                 except Exception as e:
                     logger.warning(f"Source '{getattr(src, 'name', '?')}' failed for {ticker}: {e}")
 
-            if not articles:
+            if not raw_articles:
                 continue
 
-            new_articles = self.cache.upsert_articles(articles)  # dedup über link (Cache: alles)
-
-            # In den Vektorindex NUR Artikel im Zeitfenster [target_day ± window] aufnehmen.
-            # So landet ausschließlich anomalierelevante Nachricht in RAG/Kontext; aktuelle,
-            # themenfremde Nachricht (außerhalb des Fensters) wird nicht indiziert.
+            # Zeitfenster-Filter VOR dem Cache-Schreiben: Quellen ohne Historie (z. B.
+            # Yahoo-RSS) ignorieren start/end und liefern immer "aktuelle" Artikel, die
+            # praktisch nie ins Anomaliefenster fallen. Solche Treffer werden gar nicht
+            # erst in den Cache geschrieben (statt sie dort ungenutzt anzusammeln) — sie
+            # könnten ohnehin nie in den Vektorindex gelangen (siehe Filter unten).
             epoch_from = int((target_day - timedelta(days=window)).timestamp())
             epoch_to = int((target_day + timedelta(days=window)).timestamp())
-            to_index = [
-                a for a in new_articles
+            in_window_articles = [
+                a for a in raw_articles
                 if epoch_from <= published_to_epoch(a.get("published", "")) <= epoch_to
             ]
-            if to_index:
+            if not in_window_articles:
+                continue
+
+            new_articles = self.cache.upsert_articles(in_window_articles)  # dedup über link
+            if new_articles:
                 successful_tickers += 1
-                total_new_articles += len(to_index)
-                chunks = self.chunker.process_articles(to_index)
+                total_new_articles += len(new_articles)
+                chunks = self.chunker.process_articles(new_articles)
                 chunks = self.embedder.embed_chunks(chunks)
                 self.vectorstore.add_chunks(chunks)
-                self.cache.mark_indexed([a.get("link") for a in to_index])
+                self.cache.mark_indexed([a.get("link") for a in new_articles])
                 total_chunks += len(chunks)
-                logger.info(f"Indexed {len(to_index)} in-window articles for {ticker} "
-                            f"({len(chunks)} chunks); {len(new_articles) - len(to_index)} out-of-window cached only")
+                logger.info(f"Indexed {len(new_articles)} in-window articles for {ticker} "
+                            f"({len(chunks)} chunks)")
 
         stats = {
             "tickers_processed": len(tickers),

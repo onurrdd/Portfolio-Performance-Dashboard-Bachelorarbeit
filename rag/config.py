@@ -40,5 +40,12 @@ class RAGConfig:
     # --- Datenbeschaffung ---
     news_limit: int = 5
 
+    # --- SEC EDGAR (historische Filings, kein API-Key nötig) ---
+    sec_forms: tuple = ("8-K", "10-Q", "10-K")
+    # Lange Dokumente (Filings) werden auf diese Zeichenzahl gekürzt, bevor sie
+    # dem RecursiveCharacterTextSplitter übergeben werden — hier wird Chunking
+    # erstmals inhaltlich relevant (nicht nur ein No-Op wie bei kurzen Headlines).
+    max_document_chars: int = 12000
+
 
 DEFAULT_CONFIG = RAGConfig()

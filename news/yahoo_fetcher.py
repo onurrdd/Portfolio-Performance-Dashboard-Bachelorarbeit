@@ -147,6 +147,10 @@ class YahooRSSSource:
     neuesten Artikel, daher werden start/end ignoriert.
     """
     name = "yahoo_rss"
+    # RSS kennt keine Historie: start/end werden ignoriert, es kommen immer die
+    # aktuellsten Artikel. Die Pipeline überspringt diese Quelle daher bei
+    # Fenstern, die nicht die Gegenwart enthalten (kein nutzloser Netz-Request).
+    supports_date_range = False
 
     def __init__(self):
         self._fetcher = YahooFinanceFetcher()

@@ -23,6 +23,8 @@ data/processed/
 data/faiss/
 data/chroma/
 data/news_cache.db
+data/price_cache.db
+data/_backup_before_rebuild/
 
 # Claude Code interne Einstellungen
 .claude/

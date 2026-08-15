@@ -9,6 +9,7 @@ if sys.stderr.encoding != 'utf-8':
     sys.stderr.reconfigure(encoding='utf-8', errors='replace')
 
 import logging
+import uuid
 from dotenv import load_dotenv
 
 import dash
@@ -31,6 +32,14 @@ import auto_load
 from utils.finance import fetch_price_at_date
 
 _initial_positions = auto_load.load_initial_positions(fetch_price_at_date)
+
+# Eindeutige ID für DIESEN Prozesslauf. Zusammen mit dem 'server-run-id'-Store
+# (storage_type='memory', siehe Layout) unterscheidet dies einen echten Neustart
+# (python dashboard.py neu gestartet -> neue RUN_ID) von einem bloßen Browser-Refresh
+# (F5 -> gleicher Prozess, gleiche RUN_ID). Nur bei einem echten Neustart werden die
+# CSV-Startpositionen neu geladen; sonst bleibt der Session-Zustand über F5 hinweg
+# unverändert (siehe callbacks/portfolio.py::manage_portfolio).
+_RUN_ID = str(uuid.uuid4())
 
 # --- App ---
 app = dash.Dash(__name__, external_stylesheets=[dbc.themes.BOOTSTRAP])
@@ -294,11 +303,66 @@ app.layout = html.Div([
                         ]),
                     ])
                 ]),
+                dbc.Tab(label="Vergleich", tab_id="tab-compare", children=[
+                    html.Div([
+                        dbc.Row([
+                            dbc.Col([
+                                html.P("Startet Naive-LLM und RAG-LLM mit einem Klick und zeigt beide Antworten "
+                                       "nebeneinander — für den direkten Vergleich (identischer Prompt, einziger "
+                                       "Unterschied ist der RAG-Kontext).", className="text-muted mb-3"),
+                                dbc.Button("Beide analysieren (Naive + RAG)", id="btn-compare-analyze",
+                                          color="primary", className="btn-custom mb-3", size="lg"),
+                            ])
+                        ], className="mt-4"),
+                        dbc.Row([
+                            dbc.Col([
+                                dbc.Card([
+                                    dbc.CardHeader("Naive LLM", className="card-header-custom"),
+                                    dbc.CardBody([
+                                        dcc.Loading(id="loading-compare-naive", type="default",
+                                                   children=html.Div(id="compare-naive-output", style={'whiteSpace': 'pre-wrap'})),
+                                        dbc.Button("Prompt anzeigen (vorübergehend/Debug)", id="btn-toggle-compare-naive-prompt",
+                                                  color="secondary", size="sm", className="btn-custom mt-3"),
+                                        dbc.Collapse(
+                                            html.Div(id="compare-naive-prompt-container"),
+                                            id="collapse-compare-naive-prompt",
+                                            is_open=False,
+                                        )
+                                    ])
+                                ], className="card-custom")
+                            ], width=6),
+                            dbc.Col([
+                                dbc.Card([
+                                    dbc.CardHeader("LLM mit RAG", className="card-header-custom"),
+                                    dbc.CardBody([
+                                        dcc.Loading(id="loading-compare-rag", type="default",
+                                                   children=html.Div(id="compare-rag-output", style={'whiteSpace': 'pre-wrap'})),
+                                        dbc.Button("Prompt anzeigen (vorübergehend/Debug)", id="btn-toggle-compare-rag-prompt",
+                                                  color="secondary", size="sm", className="btn-custom mt-3"),
+                                        dbc.Collapse(
+                                            html.Div(id="compare-rag-prompt-container"),
+                                            id="collapse-compare-rag-prompt",
+                                            is_open=False,
+                                        )
+                                    ])
+                                ], className="card-custom")
+                            ], width=6),
+                        ]),
+                    ])
+                ]),
             ], id="tabs", active_tab="tab-overview"),
 
-            dcc.Store(id='portfolio-store', data={'positions': _initial_positions}),
-            dcc.Store(id='analysis-data', data={}),
-            dcc.Store(id='rag-status', data={'indexed_tickers': [], 'doc_count': 0}),
+            # storage_type='session': übersteht Browser-Refresh (F5) innerhalb desselben
+            # Tabs, statt bei jedem Neuladen zurückgesetzt zu werden (Dash-Default 'memory').
+            dcc.Store(id='portfolio-store', data={'positions': _initial_positions, 'run_id': _RUN_ID},
+                     storage_type='session'),
+            dcc.Store(id='analysis-data', data={}, storage_type='session'),
+            dcc.Store(id='rag-status', data={'indexed_tickers': [], 'doc_count': 0}, storage_type='session'),
+            # storage_type='memory': wird bei JEDEM Seitenaufruf frisch aus dem aktuell
+            # laufenden Prozess gerendert (im Gegensatz zu 'session' NIE aus dem Browser
+            # wiederhergestellt) — die zuverlässige Quelle, um einen echten Neustart zu
+            # erkennen (siehe _RUN_ID oben).
+            dcc.Store(id='server-run-id', data=_RUN_ID, storage_type='memory'),
 
         ], fluid=True, className="main-container")
     ])
@@ -307,7 +371,7 @@ app.layout = html.Div([
 # Register callbacks
 from callbacks import register_all
 
-register_all(app, rag_provider)
+register_all(app, rag_provider, _initial_positions, _RUN_ID)
 
 if __name__ == '__main__':
     app.run(debug=True, port=8050)

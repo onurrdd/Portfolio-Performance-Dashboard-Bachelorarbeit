@@ -90,6 +90,113 @@ def _collect_rag_context(rag_pipeline, analysis_data):
     return context, retrieved
 
 
+def _run_rag_analysis(rag_pipeline, analysis_data):
+    """Führt die RAG-Analyse aus und baut Ergebniskarte + Quellenliste.
+
+    Gemeinsame Logik für den RAG-Tab UND den Vergleichs-Tab (ein Trigger-Button löst
+    dort beide Analysen aus) — identischer Code, ein einziger Ort zum Pflegen.
+    """
+    if not rag_pipeline:
+        return dbc.Alert("RAG Pipeline nicht verfügbar oder nicht initialisiert", color="warning")
+    if not analysis_data or not analysis_data.get('positions'):
+        return dbc.Alert("Keine Portfolio-Daten verfügbar. Bitte füge zuerst Positionen hinzu.", color="warning")
+
+    try:
+        # 1+2) NUR anomalie-bezogene Nachrichten indizieren und abrufen — unter dem
+        # Store-Lock (kein paralleler Zugriff mit dem Auto-Fetch-Thread).
+        with _rag_lock:
+            _index_anomaly_news(rag_pipeline, analysis_data)
+            context, retrieved = _collect_rag_context(rag_pipeline, analysis_data)
+
+        # 3) IDENTISCHER Prompt wie im Naive-Tab, plus abgerufener Nachrichten-Kontext.
+        prompt = build_portfolio_prompt(analysis_data, news_context=context or None)
+
+        client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
+        response = client.chat.completions.create(
+            messages=[{"role": "user", "content": prompt}],
+            model=MODEL,
+            max_tokens=MAX_TOKENS,
+        )
+        llm_response = response.choices[0].message.content
+
+        # Antwort
+        components = [
+            dbc.Card([dbc.CardBody([
+                html.H5("RAG-gestützte Analyse", className="mb-3", style={'color': '#f0f6fc'}),
+                html.Div(llm_response, style={
+                    'whiteSpace': 'pre-wrap', 'lineHeight': '1.6', 'fontSize': '0.95rem',
+                    'color': '#f0f6fc'
+                }),
+                html.Hr(),
+                html.Small(
+                    f"Erstellt mit Groq ({MODEL}) · Gleicher Prompt wie Naive-LLM, zusätzlich "
+                    f"{len(retrieved)} abgerufene Nachrichten-Snippets als Kontext.",
+                    className="text-muted"
+                )
+            ])], className="card-custom mt-3")
+        ]
+
+        # Quellen (Top-K)
+        if retrieved:
+            components.append(html.H5("📰 Verwendete Quellen", style={
+                'color': '#79c0ff', 'marginTop': '20px', 'marginBottom': '10px'}))
+            for i, chunk in enumerate(retrieved, 1):
+                md = chunk.get('metadata', {})
+                not_dated = md.get('date_filtered') is False
+                components.append(dbc.Card([dbc.CardBody([
+                    dbc.Row([
+                        dbc.Col([html.H6(f"[{i}] {md.get('ticker', 'N/A')} - {md.get('title', 'N/A')[:60]}",
+                                         style={'color': '#58a6ff'})], width=9),
+                        dbc.Col([
+                            html.Small(md.get('source', 'Unknown'), className="text-muted d-block"),
+                            html.Small(md.get('published', '')[:10], className="text-muted")
+                        ], width=3)
+                    ]),
+                    html.P(chunk.get('text', '')[:200] + "...",
+                           className="text-muted small", style={'marginTop': '10px', 'marginBottom': '10px'}),
+                    html.Div([
+                        html.A("📌 Link zur Nachricht", href=md.get('link', '#'), target="_blank",
+                               className="small", style={'color': '#79c0ff', 'textDecoration': 'underline'}),
+                        html.Span(" · Kontext nicht aus dem Anomaliefenster (Fallback)",
+                                  className="small text-warning") if not_dated else None,
+                    ])
+                ])], className="card-custom", style={'marginBottom': '10px'}))
+
+        return html.Div(components)
+
+    except Exception as e:
+        logger.error(f"Error in RAG analysis: {e}")
+        import traceback
+        traceback.print_exc()
+        return dbc.Alert([
+            html.H5("Fehler bei der RAG-Analyse", className="mb-2"),
+            html.P(f"Fehlerdetails: {str(e)}"),
+        ], color="danger")
+
+
+def _rag_prompt_component(rag_provider, analysis_data):
+    """Baut die Debug-Anzeige des exakten RAG-Prompts (inkl. abgerufenem Nachrichten-
+    Kontext). Gemeinsame Logik für den 'Prompt anzeigen'-Button im RAG-Tab UND im
+    Vergleichs-Tab.
+    """
+    if not analysis_data or not analysis_data.get('positions'):
+        return dbc.Alert("Keine Portfolio-Daten verfügbar.", color="warning")
+
+    rag_pipeline = rag_provider.get()
+    if not rag_pipeline:
+        prompt = build_portfolio_prompt(analysis_data)
+        return html.Pre(
+            prompt + "\n\n[RAG nicht verfügbar — Nachrichten-Kontext fehlt]",
+            style=PROMPT_DEBUG_STYLE)
+
+    with _rag_lock:
+        _index_anomaly_news(rag_pipeline, analysis_data)
+        context, _ = _collect_rag_context(rag_pipeline, analysis_data)
+
+    prompt = build_portfolio_prompt(analysis_data, news_context=context or None)
+    return html.Pre(prompt, style=PROMPT_DEBUG_STYLE)
+
+
 def register(app, rag_provider):
 
     @app.callback(
@@ -126,82 +233,22 @@ def register(app, rag_provider):
             return ""
         # RAG wird hier beim ersten Klick geladen (lazy) — nicht beim App-Start.
         rag_pipeline = rag_provider.get()
-        if not rag_pipeline:
-            return dbc.Alert("RAG Pipeline nicht verfügbar oder nicht initialisiert", color="warning")
-        if not analysis_data or not analysis_data.get('positions'):
-            return dbc.Alert("Keine Portfolio-Daten verfügbar. Bitte füge zuerst Positionen hinzu.", color="warning")
+        return _run_rag_analysis(rag_pipeline, analysis_data)
 
-        try:
-            # 1+2) NUR anomalie-bezogene Nachrichten indizieren und abrufen — unter dem
-            # Store-Lock (kein paralleler Zugriff mit dem Auto-Fetch-Thread).
-            with _rag_lock:
-                _index_anomaly_news(rag_pipeline, analysis_data)
-                context, retrieved = _collect_rag_context(rag_pipeline, analysis_data)
-
-            # 3) IDENTISCHER Prompt wie im Naive-Tab, plus abgerufener Nachrichten-Kontext.
-            prompt = build_portfolio_prompt(analysis_data, news_context=context or None)
-
-            client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
-            response = client.chat.completions.create(
-                messages=[{"role": "user", "content": prompt}],
-                model=MODEL,
-                max_tokens=MAX_TOKENS,
-            )
-            llm_response = response.choices[0].message.content
-
-            # Antwort
-            components = [
-                dbc.Card([dbc.CardBody([
-                    html.H5("RAG-gestützte Analyse", className="mb-3", style={'color': '#f0f6fc'}),
-                    html.Div(llm_response, style={
-                        'whiteSpace': 'pre-wrap', 'lineHeight': '1.6', 'fontSize': '0.95rem',
-                        'color': '#f0f6fc'
-                    }),
-                    html.Hr(),
-                    html.Small(
-                        f"Erstellt mit Groq ({MODEL}) · Gleicher Prompt wie Naive-LLM, zusätzlich "
-                        f"{len(retrieved)} abgerufene Nachrichten-Snippets als Kontext.",
-                        className="text-muted"
-                    )
-                ])], className="card-custom mt-3")
-            ]
-
-            # Quellen (Top-K)
-            if retrieved:
-                components.append(html.H5("📰 Verwendete Quellen", style={
-                    'color': '#79c0ff', 'marginTop': '20px', 'marginBottom': '10px'}))
-                for i, chunk in enumerate(retrieved, 1):
-                    md = chunk.get('metadata', {})
-                    not_dated = md.get('date_filtered') is False
-                    components.append(dbc.Card([dbc.CardBody([
-                        dbc.Row([
-                            dbc.Col([html.H6(f"[{i}] {md.get('ticker', 'N/A')} - {md.get('title', 'N/A')[:60]}",
-                                             style={'color': '#58a6ff'})], width=9),
-                            dbc.Col([
-                                html.Small(md.get('source', 'Unknown'), className="text-muted d-block"),
-                                html.Small(md.get('published', '')[:10], className="text-muted")
-                            ], width=3)
-                        ]),
-                        html.P(chunk.get('text', '')[:200] + "...",
-                               className="text-muted small", style={'marginTop': '10px', 'marginBottom': '10px'}),
-                        html.Div([
-                            html.A("📌 Link zur Nachricht", href=md.get('link', '#'), target="_blank",
-                                   className="small", style={'color': '#79c0ff', 'textDecoration': 'underline'}),
-                            html.Span(" · Kontext nicht aus dem Anomaliefenster (Fallback)",
-                                      className="small text-warning") if not_dated else None,
-                        ])
-                    ])], className="card-custom", style={'marginBottom': '10px'}))
-
-            return html.Div(components)
-
-        except Exception as e:
-            logger.error(f"Error in RAG analysis: {e}")
-            import traceback
-            traceback.print_exc()
-            return dbc.Alert([
-                html.H5("Fehler bei der RAG-Analyse", className="mb-2"),
-                html.P(f"Fehlerdetails: {str(e)}"),
-            ], color="danger")
+    @app.callback(
+        Output('compare-rag-output', 'children'),
+        Input('btn-compare-analyze', 'n_clicks'),
+        State('analysis-data', 'data'),
+        prevent_initial_call=True,
+    )
+    def analyze_rag_compare(n_clicks, analysis_data):
+        """Vergleichs-Tab, rechte Seite — identische Logik wie der RAG-Tab, ausgelöst
+        vom gemeinsamen 'btn-compare-analyze'-Button (RAG lädt zuerst Kontext, daher
+        i. d. R. einige Sekunden später fertig als die linke/Naive-Seite)."""
+        if not n_clicks:
+            return ""
+        rag_pipeline = rag_provider.get()
+        return _run_rag_analysis(rag_pipeline, analysis_data)
 
     @app.callback(
         Output('collapse-rag-prompt', 'is_open'),
@@ -215,22 +262,21 @@ def register(app, rag_provider):
         """Zeigt den EXAKTEN Prompt, der an das LLM geht — inkl. abgerufenem Nachrichten-Kontext."""
         if is_open:
             return False, no_update  # Schließen: nicht neu berechnen/abrufen
-        if not analysis_data or not analysis_data.get('positions'):
-            return True, dbc.Alert("Keine Portfolio-Daten verfügbar.", color="warning")
+        return True, _rag_prompt_component(rag_provider, analysis_data)
 
-        rag_pipeline = rag_provider.get()
-        if not rag_pipeline:
-            prompt = build_portfolio_prompt(analysis_data)
-            return True, html.Pre(
-                prompt + "\n\n[RAG nicht verfügbar — Nachrichten-Kontext fehlt]",
-                style=PROMPT_DEBUG_STYLE)
-
-        with _rag_lock:
-            _index_anomaly_news(rag_pipeline, analysis_data)
-            context, _ = _collect_rag_context(rag_pipeline, analysis_data)
-
-        prompt = build_portfolio_prompt(analysis_data, news_context=context or None)
-        return True, html.Pre(prompt, style=PROMPT_DEBUG_STYLE)
+    @app.callback(
+        Output('collapse-compare-rag-prompt', 'is_open'),
+        Output('compare-rag-prompt-container', 'children'),
+        Input('btn-toggle-compare-rag-prompt', 'n_clicks'),
+        State('collapse-compare-rag-prompt', 'is_open'),
+        State('analysis-data', 'data'),
+        prevent_initial_call=True,
+    )
+    def toggle_compare_rag_prompt(n_clicks, is_open, analysis_data):
+        """Vergleichs-Tab, rechte Seite — gleicher 'Prompt anzeigen' wie im RAG-Tab."""
+        if is_open:
+            return False, no_update
+        return True, _rag_prompt_component(rag_provider, analysis_data)
 
     @app.callback(
         Output('collapse-rag-news', 'is_open'),

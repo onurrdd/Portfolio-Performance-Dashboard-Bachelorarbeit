@@ -16,6 +16,11 @@ from datetime import datetime, timedelta
 
 os.environ.setdefault("PYTHONIOENCODING", "utf-8")
 
+# Muss VOR jedem get_sources()-Aufruf laufen: SECEdgarSource/AlphaVantageNewsSource
+# lesen SEC_USER_AGENT/ALPHAVANTAGE_API_KEY beim Konstruieren aus os.environ.
+from dotenv import load_dotenv
+load_dotenv()
+
 print("=" * 64)
 print("RAG End-to-End Smoke Test")
 print("=" * 64)
@@ -150,10 +155,6 @@ try:
     assert stats2["total_articles"] == 0, "Kein Netz-Fetch erwartet (bereits abgedeckt)"
     print(f"OK  Skip funktioniert: {stats2['tickers_skipped']} Ticker aus Cache, 0 neue Artikel")
 
-    print("\n" + "=" * 64)
-    print("ALLE TESTS BESTANDEN")
-    print("=" * 64)
-
 except AssertionError as e:
     print(f"\nFAIL Assertion: {e}")
     sys.exit(1)
@@ -164,3 +165,69 @@ except Exception as e:
     sys.exit(1)
 finally:
     shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+# --- [10] SEC EDGAR: echte historische Filings (Netzwerk, kein API-Key nötig) ----
+print("\n[10] SEC EDGAR — historisches Retrieval (AAPL, ~2024-05-02) ...")
+from news.sec_edgar import SECEdgarSource
+
+edgar = SECEdgarSource()
+if not edgar._enabled:
+    print("SKIP  SEC_USER_AGENT nicht gesetzt — SECEdgarSource-Test übersprungen")
+else:
+    try:
+        win_start = datetime(2024, 4, 29)
+        win_end = datetime(2024, 5, 5)
+        articles = edgar.fetch("AAPL", limit=5, start=win_start, end=win_end)
+        assert articles, "Keine EDGAR-Filings für AAPL im bekannten Q2-FY24-Fenster gefunden"
+        for a in articles:
+            d = datetime.fromisoformat(a["published"])
+            assert win_start <= d <= win_end, f"Filing-Datum außerhalb des Fensters: {a['published']}"
+            assert len(a["summary"]) > 200, "Dokumenttext verdächtig kurz — XBRL-Rauschen statt Fließtext?"
+            assert "us-gaap:" not in a["summary"][:500], "XBRL-Tag-Rauschen im extrahierten Text (ix:header-Filter kaputt?)"
+        print(f"OK  {len(articles)} Filing(s) im Fenster, z. B. [{articles[0]['published']}] {articles[0]['title'][:70]}")
+
+        # Chunking-Beleg: ein langes EDGAR-Dokument wird in MEHRERE Chunks gesplittet
+        # (bei kurzen RSS-Headlines ist das faktisch ein No-Op — hier wird es real).
+        from rag.chunker import NewsChunker
+        chunker = NewsChunker(chunk_size=800, overlap=100)
+        chunks = chunker.process_articles(articles)
+        multi = [a for a in articles if len(f"{a['title']}. {a['summary']}") > 800]
+        if multi:
+            assert len(chunks) > len(articles), "Langes Dokument wurde nicht in mehrere Chunks gesplittet"
+            print(f"OK  Chunking aktiv: {len(articles)} Dokument(e) -> {len(chunks)} Chunks")
+    except AssertionError as e:
+        print(f"FAIL Assertion: {e}")
+        sys.exit(1)
+    except Exception as e:
+        print(f"FAIL: {e}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
+
+
+# --- [11] Alpha Vantage: optional, nur mit Key (Kontingent schonen: 1 Request) ---
+print("\n[11] Alpha Vantage — historisches Retrieval (nur falls Key gesetzt) ...")
+from news.alpha_vantage import AlphaVantageNewsSource
+
+av = AlphaVantageNewsSource()
+if not av._enabled:
+    print("SKIP  ALPHAVANTAGE_API_KEY nicht gesetzt — AlphaVantageNewsSource-Test übersprungen")
+else:
+    try:
+        articles = av.fetch("AAPL", limit=3, start=datetime(2024, 5, 1), end=datetime(2024, 5, 5))
+        # Leeres Ergebnis ist gültig (z. B. Kontingent/Relevanzfilter); nur echte
+        # Fehler (Exceptions) sollen den Test scheitern lassen.
+        print(f"OK  Anfrage erfolgreich, {len(articles)} Artikel erhalten")
+        for a in articles:
+            assert a["published"], "Alpha-Vantage-Artikel ohne published-Datum"
+    except AssertionError as e:
+        print(f"FAIL Assertion: {e}")
+        sys.exit(1)
+    except Exception as e:
+        print(f"FAIL: {e}")
+        sys.exit(1)
+
+print("\n" + "=" * 64)
+print("ALLE TESTS BESTANDEN")
+print("=" * 64)

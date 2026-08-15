@@ -1,5 +1,7 @@
 # CLAUDE.md
 
+* Bu projeyi bachelorarbeit için hazırlıyorum. Bu nedenle benimle konuşurken kullandığın kavramlar bilimsel terimler olsunlar. Ve türkçe konuşurken bu bilimsel terimler geldiğinde parantez içinde almancalarını yaz.
+
 * Projenin base halinde hiçbir değişiklik yapmayacaksın. AI Risk Analysis kısmında da asla değişiklik yapmayacaksın. Sadece bachelorarbeit ile ilgili kısımlarında  (Naive LLM ve LLM mit RAG vs.) değişiklik yapılacak. 
 
 * LLM'e gönderilen tüm prompt'lar (Naive LLM ve LLM mit RAG sekmeleri) **her zaman İngilizce** olacak. Prompt metinlerini asla başka bir dilde yazma. LLM'in **cevap dili** ise ayrı bir `RESPONSE_LANGUAGE` değişkeniyle ("de" / "en" / "tr") seçilebilir olmalı; bu seçim prompt'un sonuna eklenen İngilizce bir talimat cümlesiyle ("Please respond in ...") yapılır. İlgili yerler: [callbacks/naive_llm.py](callbacks/naive_llm.py) ve [prompts.py](prompts.py) (RAG sekmesi bunu kullanır).
@@ -20,4 +22,6 @@
     3) için kullandığımız Inhaltverzeichnis olarak kullanacağım şekilde o aşama için yazmam gereken bölümleri ayrı bir theoretische_grundlagen.md dosyasında listele.
 
     Her önemli değişiklikte bu implementierung_schritte.md ve theoretische_grundlagen.md dosyasını güncellersin. Bazen de ben manuel güncelleyeceğim. Bu iki dosya gitignore'da olsun.
+
+* Bir mesajda hem soru hem talimat karışık gelirse: ÖNCE tüm soruları yanıtla, SONRA talimatları uygula. Talimatları uygulamadan önce soruları yanıtlamış olman gerekiyor — asla tersini yapma.
 

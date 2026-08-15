@@ -8,7 +8,16 @@ from dash import Input, Output, State, callback_context, html
 from utils.finance import fetch_price_at_date, adjust_shares_for_splits
 
 
-def register(app):
+def _resolve_stored_data(stored_data, initial_positions, run_id):
+    """Session-Daten von einem FRÜHEREN Prozesslauf (run_id stimmt nicht überein oder
+    fehlt) -> CSV-Startpositionen. Sonst unverändert (auch wenn leer) — 'zuletzt war es
+    so, also bleibt es so' innerhalb desselben Laufs, über beliebig viele F5 hinweg."""
+    if not stored_data or stored_data.get('run_id') != run_id:
+        return {'positions': initial_positions, 'run_id': run_id}
+    return stored_data
+
+
+def register(app, initial_positions, run_id):
     @app.callback(
         [Output('buy-section', 'style'),
          Output('sell-section', 'style'),
@@ -33,7 +42,8 @@ def register(app):
         [Input('btn-add', 'n_clicks'),
          Input('btn-clear', 'n_clicks'),
          Input('btn-sell', 'n_clicks'),
-         Input('upload-csv', 'contents')],
+         Input('upload-csv', 'contents'),
+         Input('server-run-id', 'data')],
         [State('input-ticker', 'value'),
          State('input-shares', 'value'),
          State('input-date', 'value'),
@@ -42,14 +52,21 @@ def register(app):
          State('upload-csv', 'filename'),
          State('portfolio-store', 'data')]
     )
-    def manage_portfolio(add_clicks, clear_clicks, sell_clicks, csv_contents,
+    def manage_portfolio(add_clicks, clear_clicks, sell_clicks, csv_contents, _run_id_trigger,
                          ticker, shares, buy_date,
                          sell_ticker, sell_shares, csv_filename, stored_data):
+        # Robust gegenüber Dashs Initial-Call-Verhalten: läuft unabhängig davon, was den
+        # Callback konkret ausgelöst hat. Innerhalb desselben Prozesslaufs ist run_id
+        # bereits aktuell, dieser Zweig ändert dann nichts mehr.
+        stored_data = _resolve_stored_data(stored_data, initial_positions, run_id)
+
         ctx = callback_context
         if not ctx.triggered:
             return stored_data, "", ""
 
         button_id = ctx.triggered[0]['prop_id'].split('.')[0]
+        if button_id == 'server-run-id':
+            return stored_data, "", ""
 
         if button_id == 'upload-csv' and csv_contents is not None:
             try:
@@ -84,7 +101,7 @@ def register(app):
                         'buy_price': buy_price_val
                     })
 
-                return {'positions': positions}, dbc.Alert(
+                return {'positions': positions, 'run_id': run_id}, dbc.Alert(
                     f"✓ {len(positions)} Positionen aus '{csv_filename}' geladen",
                     color="success", duration=3000
                 ), ""
@@ -97,7 +114,7 @@ def register(app):
                 )
 
         if button_id == 'btn-clear':
-            return {'positions': []}, dbc.Alert("Portfolio geleert", color="info", duration=3000), ""
+            return {'positions': [], 'run_id': run_id}, dbc.Alert("Portfolio geleert", color="info", duration=3000), ""
 
         if button_id == 'btn-sell':
             if not sell_ticker or not sell_shares:
@@ -122,12 +139,12 @@ def register(app):
 
                     if pos['shares'] < 0.01:
                         positions.remove(pos)
-                        return {'positions': positions}, "", dbc.Alert(
+                        return {'positions': positions, 'run_id': run_id}, "", dbc.Alert(
                             f"{sell_ticker} komplett verkauft und entfernt",
                             color="success", duration=3000
                         )
 
-                    return {'positions': positions}, "", dbc.Alert(
+                    return {'positions': positions, 'run_id': run_id}, "", dbc.Alert(
                         f"{sell_shares} Aktien von {sell_ticker} verkauft (verbleibend: {int(current_shares - sell_shares)})",
                         color="success", duration=3000
                     )
@@ -156,7 +173,7 @@ def register(app):
                 }
                 positions = stored_data.get('positions', [])
                 positions.append(new_position)
-                return {'positions': positions}, dbc.Alert(f"{ticker.upper()} erfolgreich hinzugefügt", color="success", duration=3000), ""
+                return {'positions': positions, 'run_id': run_id}, dbc.Alert(f"{ticker.upper()} erfolgreich hinzugefügt", color="success", duration=3000), ""
 
             except Exception as e:
                 return stored_data, dbc.Alert(f"Fehler: {str(e)}", color="danger", duration=3000), ""

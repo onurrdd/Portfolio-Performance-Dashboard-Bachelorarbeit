@@ -24,8 +24,17 @@ class NewsSource(Protocol):
     (ör. saf RSS feed'i) bunları yok sayıp en güncel makaleleri döndürebilir.
     Tarihsel/tarih-aralıklı kaynaklar (çeyrek raporları, haber arşivleri)
     bunları kullanarak anomali gününe denk pencereyi hedefleyebilir.
+
+    `supports_date_range` bu ayrımı kaynağın KENDİSİNİN bildirdiği bir yetenek
+    (Fähigkeit) haline getirir; böylece pipeline, geçmişe ait bir pencere için
+    tarihsel erişimi olmayan kaynakları hiç çağırmaz (bkz. RAGPipeline). Bayrak
+    olmadan bu bilgi yalnızca dolaylıydı: kaynak start/end'i sessizce yok sayıp
+    güncel haberi döndürüyor, sonuç da pencere filtresinde eleniyordu — yani
+    her tarihsel anomali için boşa bir ağ isteği yapılıyordu.
     """
     name: str
+    # False = kaynak yalnızca "şu an"ı biliyor (start/end'i yok sayar).
+    supports_date_range: bool
 
     def fetch(self, ticker: str, limit: int = 10,
               start: Optional[datetime] = None,
@@ -69,6 +78,20 @@ def published_to_epoch(iso_str: str) -> int:
 
 
 def get_sources() -> List[NewsSource]:
-    """Aktif kaynakların kayıt listesi. Yeni kaynak = burada bir satır."""
+    """Aktif kaynakların kayıt listesi. Yeni kaynak = burada bir satır.
+
+    Sıralama önemli değil (pipeline hepsinden toplar), ama Yahoo en ucuz/hızlı
+    olduğu için önce dener. SEC EDGAR ve Alpha Vantage anahtar/ayar yoksa kendini
+    otomatik devre dışı bırakır (bkz. .env.example) — sistem yine de çalışır.
+    """
     from news.yahoo_fetcher import YahooRSSSource
-    return [YahooRSSSource()]
+    from news.sec_edgar import SECEdgarSource
+    from news.alpha_vantage import AlphaVantageNewsSource
+    from rag.config import DEFAULT_CONFIG
+
+    return [
+        YahooRSSSource(),
+        SECEdgarSource(forms=DEFAULT_CONFIG.sec_forms,
+                       max_document_chars=DEFAULT_CONFIG.max_document_chars),
+        AlphaVantageNewsSource(),
+    ]

@@ -1,6 +1,5 @@
 import numpy as np
 import pandas as pd
-import yfinance as yf
 import plotly.graph_objs as go
 import dash_bootstrap_components as dbc
 from dash import Input, Output, html
@@ -8,8 +7,9 @@ from dash import Input, Output, html
 from utils.finance import (
     calculate_portfolio_timeseries,
     adjust_shares_for_splits,
-    adjust_price_for_splits,
     build_pme_positions,
+    get_current_price,
+    get_benchmark_history,
 )
 from utils.anomaly import detect_anomalies
 from utils.metrics import (
@@ -85,13 +85,18 @@ def register(app):
 
             for pos in positions:
                 try:
-                    ticker_obj = yf.Ticker(pos['ticker'])
-                    current_price = ticker_obj.history(period="1d")['Close'].iloc[-1]
+                    current_price = get_current_price(pos['ticker'])
                     current_shares = adjust_shares_for_splits(pos['ticker'], pos['shares'], pos['buy_date'])
-                    display_buy_price = adjust_price_for_splits(pos['ticker'], pos['buy_price'], pos['buy_date'])
 
                     current_value = current_shares * current_price
-                    invested = pos['shares'] * display_buy_price
+                    # Kaufpreis bewusst in HEUTIGER (split-bereinigter) Skala — dieselbe Skala
+                    # wie current_shares und current_price. Vorher wurde hier der auf die
+                    # historische Vor-Split-Skala hochgerechnete Preis angezeigt, während die
+                    # Shares-Spalte bereits split-bereinigt war: "Shares x Buy Price" ergab in
+                    # der Tabelle dann ein um den Split-Faktor zu hohes Produkt (z. B. 300 x
+                    # $2.346 statt 300 x $117). Der investierte Betrag ist in beiden Skalen
+                    # identisch; nur die Anzeige ist jetzt in sich konsistent.
+                    invested = current_shares * pos['buy_price']
                     pnl = current_value - invested
                     pnl_pct = (pnl / invested) * 100 if invested > 0 else 0
 
@@ -102,7 +107,7 @@ def register(app):
                         'Ticker': pos['ticker'],
                         'Shares': f"{current_shares}",
                         'Buy Date': pos['buy_date'],
-                        'Buy Price': f"${display_buy_price:.2f}",
+                        'Buy Price': f"${pos['buy_price']:.2f}",
                         'Current': f"${current_price:.2f}",
                         'Value': f"${current_value:.2f}",
                         'P&L': f"${pnl:.2f} ({pnl_pct:+.1f}%)"
@@ -255,8 +260,7 @@ def register(app):
             benchmark_stats = {'total_return': 0, 'sortino': 0, 'sharpe_current': 0}
             active_return_breaks = []
             try:
-                spy = yf.Ticker('SPY')
-                spy_hist = spy.history(start=df['Date'].min(), end=df['Date'].max())
+                spy_hist = get_benchmark_history('SPY', df['Date'].min(), df['Date'].max())
                 if not spy_hist.empty:
                     # Public Market Equivalent (PME)-Anpassung: simuliert die gleichen
                     # Kapitalzuflüsse (buy_date, investierter Betrag) im S&P 500, damit
@@ -283,7 +287,7 @@ def register(app):
                     port_dates = returns.index if twr is not None else df.loc[returns.index, 'Date']
 
                     # Anomalie-Erkennung (Plan B): Market-Model-Surprise + robuster
-                    # Median/MAD-z-Score, siehe utils/anomaly.py und ANOMALY_DETECTION.md.
+                    # Median/MAD-z-Score, siehe utils/anomaly.py.
                     active_return_breaks = detect_anomalies(
                         returns, spy_returns_for_chart, positions, price_df
                     )
