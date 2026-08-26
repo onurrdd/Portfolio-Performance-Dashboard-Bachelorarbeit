@@ -60,7 +60,7 @@ Bitte bewerte diese Metriken kurz und prägnant:
 
             response = client.chat.completions.create(
                 messages=[{"role": "user", "content": prompt}],
-                model="llama-3.3-70b-versatile",
+                model="openai/gpt-oss-120b",
                 max_tokens=2048,
             )
             analysis_text = response.choices[0].message.content

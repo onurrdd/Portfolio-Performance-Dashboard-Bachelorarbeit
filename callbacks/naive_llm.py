@@ -1,12 +1,33 @@
 import os
+from datetime import datetime
 import pandas as pd
 from groq import Groq
 import dash_bootstrap_components as dbc
 from dash import Input, Output, State, html, no_update
 
+# Leichtgewichtig (nur sqlite3, keine Torch/Embedding-Importe) — unabhängig vom lazy
+# RAGProvider, daher hier gefahrlos verwendbar, ohne die schwere Pipeline zu laden.
+from rag.cache import NewsCache
+from rag.config import DEFAULT_CONFIG
+
 # Sprache der LLM-ANTWORT: "de", "en" oder "tr".
 # Die Prompts selbst sind IMMER Englisch (Projektregel, siehe CLAUDE.md).
-RESPONSE_LANGUAGE = "en"
+RESPONSE_LANGUAGE = "tr"
+
+# Generierungsmodell für Naive-LLM UND RAG-LLM (identisch, siehe callbacks/rag.py::MODEL).
+# Ursprünglich llama-3.3-70b-versatile; von Groq zwischenzeitlich aus dem Angebot
+# entfernt (API liefert 404 "model does not exist"). Ersatz: openai/gpt-oss-120b
+# (ein Reasoning-Modell — benötigt ausreichend max_tokens, da vor der Antwort ein
+# interner Denkschritt Tokens verbraucht; 4096 hat sich als ausreichend erwiesen).
+GENERATOR_MODEL = "openai/gpt-oss-120b"
+
+# Antwortbudget für BEIDE Bedingungen (Naive-LLM und RAG-LLM). Der Prompt verlangt eine
+# eigene Erklärung je Anomalie; bei ~100 Ereignissen reicht ein kleines Budget nicht, die
+# Antwort bricht dann am Ende der Liste ab. Modell UND Parameter müssen über beide
+# Bedingungen identisch sein — sonst wäre ein beobachteter Unterschied nicht mehr allein
+# dem Retrieval zuzuschreiben (siehe implementierung_schritte.md, Faz 2 / madde 9).
+# callbacks/rag.py::MAX_TOKENS spiegelt diesen Wert.
+GENERATION_MAX_TOKENS = 32768
 
 # Flag: Teil 1 (Performance vs. Benchmark) temporär deaktiviert — Forschungsfrage fokussiert
 # jetzt auf die kausale Erklärung von Anomalie-Ereignissen (Teil 2), nicht mehr auf die
@@ -89,10 +110,10 @@ TABLE_LANGUAGE = "de"
 TABLE_HEADERS = {
     "tr": ['#', 'Tarih', 'Gerçekleşen', 'Beklenen', 'Sürpriz', 'Sürpriz (MAD-z)',
            'Benchmark (MAD-z)', 'β', 'Sorumlu Ticker', 'Hisse Getirisi',
-           'Hisse Sürprizi', 'Hisse (MAD-z)', 'Uyarı'],
+           'Hisse Sürprizi', 'Hisse (MAD-z)', 'Uyarı', 'Kaynak'],
     "de": ['#', 'Datum', 'Tatsächlich', 'Erwartet', 'Überraschung', 'Überraschung (MAD-z)',
            'Benchmark (MAD-z)', 'β', 'Verantwortlicher Ticker', 'Titel-Rendite',
-           'Titel-Residuum', 'Titel (MAD-z)', 'Warnung'],
+           'Titel-Residuum', 'Titel (MAD-z)', 'Warnung', 'Quelle'],
 }
 
 CONCENTRATION_LABELS = {
@@ -101,8 +122,10 @@ CONCENTRATION_LABELS = {
 }
 
 TABLE_TEXT = {
-    "tr": {"no_breaks": "Anomali günü tespit edilmedi.", "not_attributable": "— (atfedilemez)", "dash": "—"},
-    "de": {"no_breaks": "Kein Anomalietag festgestellt.", "not_attributable": "— (nicht zuordenbar)", "dash": "—"},
+    "tr": {"no_breaks": "Anomali günü tespit edilmedi.", "not_attributable": "— (atfedilemez)", "dash": "—",
+           "source_count": "{n} kaynak"},
+    "de": {"no_breaks": "Kein Anomalietag festgestellt.", "not_attributable": "— (nicht zuordenbar)", "dash": "—",
+           "source_count": "{n} Quelle(n)"},
 }
 
 
@@ -188,8 +211,8 @@ def _run_naive_analysis(analysis_data):
 
         response = client.chat.completions.create(
             messages=[{"role": "user", "content": prompt}],
-            model="llama-3.3-70b-versatile",
-            max_tokens=4096,
+            model=GENERATOR_MODEL,
+            max_tokens=GENERATION_MAX_TOKENS,
         )
         analysis_text = response.choices[0].message.content
 
@@ -281,6 +304,10 @@ def register(app):
             content = dbc.Alert(text["no_breaks"], color="info")
         else:
             df = pd.DataFrame(breaks)
+            # NewsCache liest nur die bestehende SQLite-Datei — kein RAG-Init, kein
+            # Fetch. Öffnen dieser Tabelle triggert daher niemals einen Netzabruf.
+            cache = NewsCache(DEFAULT_CONFIG.db_path)
+            window = DEFAULT_CONFIG.anomaly_window_days
 
             def _ticker_cell(row):
                 if pd.isna(row['responsible_ticker']):
@@ -288,6 +315,28 @@ def register(app):
                 conc = row.get('concentration')
                 conc_label = f" · {conc_labels.get(conc, conc)}" if pd.notna(conc) else ""
                 return f"{row['responsible_ticker']} ({row['ticker_contribution_pct']:+.2f}%){conc_label}"
+
+            def _source_cell(b):
+                """Zeigt, ob im Cache bereits Quellen für (Ticker, Anomalietag ± Fenster)
+                liegen. Nur für Tage relevant, die überhaupt ein RAG-Ziel sind
+                ('Hisseye özgü' + zugeordneter Ticker) — für alle anderen wird nie
+                gefetcht, daher hier auch kein Cache-Treffer möglich."""
+                ticker = b.get('responsible_ticker')
+                if b.get('concentration') != 'Hisseye özgü' or not ticker:
+                    return html.Span(text["dash"], className="text-muted")
+                try:
+                    day = datetime.fromisoformat(str(b['date'])[:10])
+                    n = len(cache.get_articles(ticker, day, window))
+                except (ValueError, TypeError):
+                    n = 0
+                if n == 0:
+                    return html.Span(text["dash"], className="text-muted")
+                return dbc.Button(
+                    text["source_count"].format(n=n),
+                    id={'type': 'anomaly-source-btn', 'ticker': ticker, 'date': b['date']},
+                    size="sm", color="link", className="p-0",
+                    style={'textDecoration': 'underline', 'verticalAlign': 'baseline'},
+                )
 
             out = pd.DataFrame({
                 'date': df['date'],
@@ -307,9 +356,20 @@ def register(app):
                 'flags': df['flags'].apply(lambda x: x if x else text["dash"]),
             })
             out.insert(0, '#', range(1, len(out) + 1))
-            out.columns = TABLE_HEADERS[lang]
-            content = dbc.Table.from_dataframe(
-                out, striped=True, bordered=True, hover=True, responsive=True, className="mt-2"
+            out.columns = TABLE_HEADERS[lang][:len(out.columns)]
+
+            # dbc.Table.from_dataframe rendert Zellen über str() — für die klickbare
+            # Quellen-Spalte (Dash-Komponenten statt Text) wird die Tabelle daher
+            # manuell aus thead/tbody gebaut; alle Text-Spalten bleiben unverändert.
+            header_row = html.Tr([html.Th(h) for h in TABLE_HEADERS[lang]])
+            body_rows = []
+            for i, (_, row) in enumerate(out.iterrows()):
+                cells = [html.Td(v) for v in row]
+                cells.append(html.Td(_source_cell(breaks[i])))
+                body_rows.append(html.Tr(cells))
+            content = dbc.Table(
+                [html.Thead(header_row), html.Tbody(body_rows)],
+                striped=True, bordered=True, hover=True, responsive=True, className="mt-2"
             )
 
         return not is_open, content

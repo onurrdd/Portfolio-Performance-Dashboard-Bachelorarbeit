@@ -9,6 +9,9 @@ python-dotenv==1.0.0
 faiss-cpu>=1.7.4
 sentence-transformers>=2.2.2
 langchain-text-splitters>=0.3
+ragas==0.4.3
+langchain-community==0.4.1
+langchain-openai>=1.1
 requests==2.31.0
 beautifulsoup4==4.12.2
 feedparser==6.0.10

@@ -60,19 +60,28 @@ class NewsCache:
         finally:
             con.close()
 
-    def has_coverage(self, ticker: str, day: datetime, window_days: int) -> bool:
+    def has_coverage(self, ticker: str, day: datetime, window_days: int,
+                     source: Optional[str] = None) -> bool:
         """Existiert für `ticker` mindestens ein datierter Artikel in [day ± window_days]?
 
         Undatierte Artikel (published_epoch = 0) zählen nicht als Abdeckung.
+
+        `source`: Wird ein Quellenname übergeben, zählt nur die Abdeckung DURCH DIESE
+        QUELLE. Grund: Die Abdeckung ist quellenspezifisch — hat z. B. SEC EDGAR ein
+        Fenster bereits befüllt, heißt das nicht, dass auch die Nachrichten-API dort
+        schon gefragt wurde. Ohne diese Unterscheidung würde ein Treffer einer einzigen
+        Quelle alle übrigen Quellen für dieses Fenster dauerhaft blockieren.
         """
         epoch_from = int((day - timedelta(days=window_days)).timestamp())
         epoch_to = int((day + timedelta(days=window_days)).timestamp())
+        sql = ("SELECT COUNT(*) FROM articles "
+               "WHERE ticker=? AND published_epoch BETWEEN ? AND ? AND published_epoch > 0")
+        params = [ticker, epoch_from, epoch_to]
+        if source is not None:
+            sql += " AND source=?"
+            params.append(source)
         with self._connect() as con:
-            row = con.execute(
-                "SELECT COUNT(*) FROM articles "
-                "WHERE ticker=? AND published_epoch BETWEEN ? AND ? AND published_epoch > 0",
-                (ticker, epoch_from, epoch_to),
-            ).fetchone()
+            row = con.execute(sql, tuple(params)).fetchone()
         return row[0] > 0
 
     def get_articles(self, ticker: str, day: Optional[datetime] = None,

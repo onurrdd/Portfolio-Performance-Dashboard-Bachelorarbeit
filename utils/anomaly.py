@@ -8,17 +8,15 @@ Ansatz (Market-Model + robuste Ausreißererkennung):
      gemessen (Tag selbst ausgeschlossen). Median/MAD statt Mittel/Std, um das
      Maskierungsproblem (ein Extremtag bläht σ auf) zu vermeiden.
   3. Feste Schwelle: |mad_z| > THRESHOLD (nicht perzentilbasiert).
-  4. Zustand des Benchmarks am selben Tag: war der Benchmark selbst extrem?
-       Benchmark extrem  → "Piyasa da ekstrem" (Markt ebenfalls extrem)
-       Benchmark normal  → "Piyasa normal" (Markt normal)
-     Das Label beschreibt AUSSCHLIESSLICH den Zustand des Benchmarks an diesem Tag —
-     es ist bewusst KEINE Aussage über Ent- oder Gleichlauf ("Decoupling"): geprüft
-     wird |z| des Benchmarks ohne Richtungsvergleich, sodass ein gleichgerichteter
-     Extremtag dasselbe Label erhielte wie ein gegenläufiger.
-     Methodischer Sinn des Flags: bei einem extremen Benchmark-Tag extrapoliert das
-     lineare Markt-Modell (α + β·Markt) weit über den Bereich hinaus, in dem β
-     geschätzt wurde — die erwartete Rendite und damit das Residuum sind an solchen
-     Tagen weniger belastbar und sollten vorsichtiger interpretiert werden.
+  4. Zustand des Benchmarks am selben Tag wird als ZAHL mitgeführt (benchmark_mad_z),
+     nicht als Kategorie. Methodischer Sinn: bei einem extremen Benchmark-Tag
+     extrapoliert das lineare Markt-Modell (α + β·Markt) weit über den Bereich hinaus,
+     in dem β geschätzt wurde — die erwartete Rendite und damit das Residuum sind an
+     solchen Tagen weniger belastbar und vorsichtiger zu interpretieren.
+     BEWUSST KEIN Filter: an solchen Tagen finden sehr wohl echte titelspezifische
+     Ereignisse statt (Makro-Schock und Einzeltitel-Nachricht schließen sich nicht aus).
+     Ein Ausschluss würde reale, belegbare Ereignisse verwerfen; die Zahl dient daher
+     nur der Interpretation.
   5. Billige Filter: Kaufdatum ±1 Tag, stale/ffill-Preis am Tag.
   6. Ticker-Zerlegung: welcher Titel trägt den Surprise (vorzeichentreu)?
      WICHTIG: Der Beitrag wird auf dem RESIDUUM des Titels gemessen, nicht auf seiner
@@ -54,7 +52,15 @@ _CONCENTRATION_CUTOFF = 0.6  # Einzeltitel- vs. verteilt-Grenze
 # Portfolio-3-MAD-z-Tag kann für einen volatilen Titel (z. B. TSLA) ein völlig normaler
 # ~2-Sigma-Tag sein, zu dem es keine Nachricht gibt. Ohne diesen Test würde das RAG für
 # solche Tage vergeblich (und quotenverbrauchend) nach Nachrichten suchen.
-_TICKER_MAD_Z_THRESHOLD = 3
+#
+# BEWUSST NIEDRIGER als die Portfolio-Schwelle (MAD_Z_THRESHOLD = 3): Die Begründung des
+# Tests ist ja gerade, dass die Residuen-Streuung eines Einzeltitels HÖHER ist. Dieselbe
+# Schwelle auf beiden Ebenen wäre auf Titelebene daher eine deutlich härtere Hürde und hat
+# in der Praxis auch zweistellige Tagesverluste verworfen — also Tage, zu denen es mit
+# hoher Wahrscheinlichkeit sehr wohl eine Nachricht gibt. 2,5 erhält den Schutzzweck
+# (offensichtlich unauffällige Titeltage fallen weiterhin heraus), ohne diese Klasse
+# echter Ereignisse zu verlieren.
+_TICKER_MAD_Z_THRESHOLD = 2.5
 
 
 def _rolling_mad(series, window, min_obs):
@@ -257,8 +263,6 @@ def detect_anomalies(portfolio_returns, benchmark_returns, positions, price_df,
         if pd.isna(s_val):
             continue
         b_z = benchmark_z.loc[day]
-        classification = ('Piyasa da ekstrem' if (pd.notna(b_z) and abs(b_z) > threshold)
-                          else 'Piyasa normal')
         (responsible_ticker, ticker_contribution_pct, concentration,
          ticker_own_return_pct, ticker_own_residual_pct,
          ticker_own_mad_z) = _ticker_attribution(
@@ -274,7 +278,6 @@ def detect_anomalies(portfolio_returns, benchmark_returns, positions, price_df,
             'benchmark_return_pct': float(b.loc[day] * 100),
             'benchmark_mad_z': float(b_z) if pd.notna(b_z) else None,
             'beta': float(beta.loc[day]) if pd.notna(beta.loc[day]) else None,
-            'classification': classification,
             'responsible_ticker': responsible_ticker,
             'ticker_contribution_pct': ticker_contribution_pct,   # Residuen-Beitrag (Auswahlmaß)
             'ticker_own_return_pct': ticker_own_return_pct,        # rohe Tagesrendite (für News)

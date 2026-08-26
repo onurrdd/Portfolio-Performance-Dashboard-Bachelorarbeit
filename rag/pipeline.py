@@ -9,7 +9,7 @@ Metadaten-Filterung (Exposé 3.4): Retrieval kann nach Ticker und/oder Zeitfenst
 eingeschränkt werden. Da FAISS keine native where-Filterung besitzt, wird ein größerer
 Kandidaten-Pool geholt und anschließend in Python gefiltert (siehe RAGConfig.filter_pool_size).
 """
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Set
 import logging
 from datetime import datetime, timedelta
 
@@ -45,15 +45,21 @@ class RAGPipeline:
 
     def index_news_for_tickers(self, tickers: List[str], news_limit: Optional[int] = None,
                                target_day: Optional[datetime] = None,
-                               coverage_window_days: Optional[int] = None) -> Dict:
-        """Holt Nachrichten (über ALLE Quellen) und indiziert nur NEUE Artikel.
+                               coverage_window_days: Optional[int] = None,
+                               only_sources: Optional[Set[str]] = None) -> Dict:
+        """Holt Nachrichten und indiziert nur NEUE Artikel.
 
-        Cache-gesteuert: Ist ein Ticker für das Zeitfenster [target_day ± window] bereits
-        abgedeckt, wird kein Netz-Fetch ausgelöst (verhindert erneutes Laden bei Neustart /
-        Portfolio-Wechsel). target_day=None → heute (manueller Fetch für aktuelle News);
-        für anomalie-getriebenes Indexieren kann target_day = Anomaliedatum gesetzt werden.
-        Bereits gecachte Artikel werden per `link` dedupliziert; nur neue Artikel werden
-        embedded und in FAISS aufgenommen.
+        Cache-gesteuert und QUELLENSPEZIFISCH: Für jede Quelle wird einzeln geprüft, ob
+        sie das Fenster [target_day ± window] bereits befüllt hat; nur die noch nicht
+        abgedeckten Quellen werden angefragt. (Zuvor blockierte ein Treffer einer
+        einzigen Quelle alle übrigen Quellen für dieses Fenster.)
+
+        `only_sources`: Beschränkt den Abruf auf die genannten Quellennamen. Damit kann
+        der automatische Hintergrund-Abruf auf kontingentfreie Quellen begrenzt werden,
+        während kontingentierte Quellen dem manuell ausgelösten Abruf vorbehalten bleiben.
+
+        target_day=None → heute. Bereits gecachte Artikel werden per `link` dedupliziert;
+        nur neue Artikel werden embedded und in FAISS aufgenommen.
         """
         news_limit = news_limit or self.config.news_limit
         target_day = target_day or datetime.now()
@@ -78,7 +84,8 @@ class RAGPipeline:
             s for s in self.sources
             # Default True: eine Quelle, die das Attribut nicht deklariert, wird wie bisher
             # immer angefragt — lieber ein überflüssiger Request als stilles Datenverlieren.
-            if window_covers_now or getattr(s, "supports_date_range", True)
+            if (window_covers_now or getattr(s, "supports_date_range", True))
+            and (only_sources is None or getattr(s, "name", "") in only_sources)
         ]
         if len(usable_sources) < len(self.sources):
             skipped = [getattr(s, "name", "?") for s in self.sources if s not in usable_sources]
@@ -86,21 +93,27 @@ class RAGPipeline:
                         f"Quelle(n) ohne Zeitraum-Unterstützung übersprungen: {skipped}")
 
         for ticker in tickers:
-            if self.cache.has_coverage(ticker, target_day, window):
-                skipped_tickers += 1
-                logger.info(f"{ticker}: bereits abgedeckt (±{window}d um {target_day.date()}) — kein Fetch")
-                continue
-
             raw_articles = []
+            queried_any = False
             for src in usable_sources:
+                src_name = getattr(src, "name", "?")
+                # Abdeckung QUELLENSPEZIFISCH prüfen: hat diese Quelle das Fenster schon
+                # befüllt, wird sie nicht erneut angefragt — andere Quellen aber schon.
+                if self.cache.has_coverage(ticker, target_day, window, source=src_name):
+                    logger.info(f"{ticker}/{src_name}: bereits abgedeckt "
+                                f"(±{window}d um {target_day.date()}) — kein Fetch")
+                    continue
+                queried_any = True
                 try:
                     # start/end übergeben: quellenspezifisch — tageshistorische Quellen
                     # (SEC EDGAR, Alpha Vantage) nutzen das Fenster gezielt; reine
                     # RSS-Feeds ohne Historie ignorieren es (liefern nur Aktuelles).
                     raw_articles.extend(src.fetch(ticker, news_limit, start=win_start, end=win_end))
                 except Exception as e:
-                    logger.warning(f"Source '{getattr(src, 'name', '?')}' failed for {ticker}: {e}")
+                    logger.warning(f"Source '{src_name}' failed for {ticker}: {e}")
 
+            if not queried_any:
+                skipped_tickers += 1
             if not raw_articles:
                 continue
 
@@ -205,12 +218,20 @@ class RAGPipeline:
         return self.retrieve_context(query, top_k=top_k, filter_ticker=ticker,
                                      date_from=date_from, date_to=date_to)
 
-    def format_context_for_llm(self, retrieved_chunks: List[Dict], max_tokens: int = 2000) -> str:
-        """Formatiert die abgerufenen Chunks als Kontextblock für das LLM."""
+    def format_context_for_llm(self, retrieved_chunks: List[Dict], max_tokens: int = 2000,
+                               return_used: bool = False):
+        """Formatiert die abgerufenen Chunks als Kontextblock für das LLM.
+
+        `return_used=True` gibt zusätzlich die Liste der tatsächlich aufgenommenen Chunks
+        zurück. Ohne das wäre die Budget-Kürzung unsichtbar: der Aufrufer wüsste nicht,
+        wie viele Treffer es gar nicht in den Prompt geschafft haben, und würde stillschweigend
+        eine Antwort auswerten, deren Kontext unvollständig ist.
+        """
         if not retrieved_chunks:
-            return ""
+            return ("", []) if return_used else ""
 
         context_parts = []
+        used_chunks = []
         total_length = 0
         max_chars = max_tokens * 4
 
@@ -233,11 +254,14 @@ Content: {text}
             if total_length + len(part) > max_chars:
                 break
             context_parts.append(part)
+            used_chunks.append(chunk)
             total_length += len(part)
 
         context = "\n".join(context_parts)
-        logger.info(f"Formatted context: {len(context)} chars from {len(context_parts)} chunks")
-        return context
+        dropped = len(retrieved_chunks) - len(context_parts)
+        logger.info(f"Formatted context: {len(context)} chars from {len(context_parts)} chunks"
+                    + (f" — {dropped} Chunk(s) wegen Budget verworfen" if dropped else ""))
+        return (context, used_chunks) if return_used else context
 
     def get_stats(self) -> Dict:
         """Aktuelle Indexierungs-Statistik."""

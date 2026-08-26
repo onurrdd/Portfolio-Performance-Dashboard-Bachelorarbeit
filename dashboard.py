@@ -42,7 +42,8 @@ _initial_positions = auto_load.load_initial_positions(fetch_price_at_date)
 _RUN_ID = str(uuid.uuid4())
 
 # --- App ---
-app = dash.Dash(__name__, external_stylesheets=[dbc.themes.BOOTSTRAP])
+app = dash.Dash(__name__, external_stylesheets=[dbc.themes.BOOTSTRAP],
+                suppress_callback_exceptions=True)
 
 app.index_string = '''
 <!DOCTYPE html>
@@ -99,6 +100,15 @@ app.index_string = '''
             input::placeholder { color: #6e7681; }
             #ai-analysis-output, #ai-analysis-output * { color: #f0f6fc !important; }
             #ai-text-content { color: #f0f6fc !important; }
+            /* Modal an das dunkle Theme angleichen — Bootstrap-Default ist hell,
+               wodurch dunkler Text auf dunklem Kartenhintergrund unlesbar wurde. */
+            .modal-content { background-color: #161b22; border: 1px solid #30363d; color: #c9d1d9; }
+            .modal-header { border-bottom: 1px solid #30363d; }
+            .modal-footer { border-top: 1px solid #30363d; }
+            .modal-title { color: #f0f6fc; }
+            .modal-body { color: #c9d1d9; }
+            .modal-body p { color: #c9d1d9; }
+            .btn-close { filter: invert(1) grayscale(100%) brightness(200%); }
         </style>
     </head>
     <body>
@@ -247,7 +257,15 @@ app.layout = html.Div([
                                     html.Div(id="breaks-table-container"),
                                     id="collapse-breaks",
                                     is_open=False,
-                                )
+                                ),
+                                dbc.Modal([
+                                    dbc.ModalHeader(dbc.ModalTitle(id="anomaly-source-modal-title")),
+                                    dbc.ModalBody(id="anomaly-source-modal-body"),
+                                    dbc.ModalFooter(
+                                        dbc.Button("Schließen", id="anomaly-source-modal-close",
+                                                   className="ms-auto")
+                                    ),
+                                ], id="anomaly-source-modal", size="lg", is_open=False, scrollable=True),
                             ])
                         ]),
                         dbc.Row([
@@ -299,6 +317,14 @@ app.layout = html.Div([
                                     id="collapse-rag-prompt",
                                     is_open=False,
                                 )
+                            ])
+                        ]),
+                        dbc.Row([
+                            dbc.Col([
+                                dbc.Button("RAG-Qualität bewerten (RAGAS)", id="btn-rag-evaluate",
+                                          color="secondary", className="btn-custom mb-3"),
+                                dcc.Loading(id="loading-rag-eval", type="default",
+                                          children=html.Div(id="rag-eval-output"))
                             ])
                         ]),
                     ])
