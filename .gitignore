@@ -25,10 +25,14 @@ data/chroma/
 data/news_cache.db
 data/price_cache.db
 data/_backup_before_rebuild/
+data/ragas_eval_*.json
 
 # Claude Code interne Einstellungen
 .claude/
 
-# Bachelorarbeit-Arbeitsnotizen (nicht Teil des Codes)
-implementierung_schritte.md
-theoretische_grundlagen.md
+# Bachelorarbeit-Arbeitsnotizen und Thesistexte (nicht Teil des Codes)
+# ALLE Markdown-Dateien werden ignoriert, ohne Ausnahme (auch CLAUDE.md).
+*.md
+
+# Persoenliche Arbeitsnotizen
+metindüzelt.txt
