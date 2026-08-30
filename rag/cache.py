@@ -85,13 +85,19 @@ class NewsCache:
         return row[0] > 0
 
     def get_articles(self, ticker: str, day: Optional[datetime] = None,
-                     window_days: int = 3) -> List[Dict]:
-        """Artikel für einen Ticker; optional auf ein Zeitfenster um `day` beschränkt."""
+                     window_days: int = 3, window_days_after: Optional[int] = None) -> List[Dict]:
+        """Artikel für einen Ticker; optional auf ein Zeitfenster um `day` beschränkt.
+
+        `window_days_after`: optionales asymmetrisches Vorwärtsfenster (siehe
+        RAGConfig.anomaly_window_days_after) — None bedeutet symmetrisch (± window_days),
+        wie bisher.
+        """
         cols = "link, ticker, title, summary, published, published_epoch, source, indexed"
         with self._connect() as con:
             if day is not None:
+                after = window_days if window_days_after is None else window_days_after
                 epoch_from = int((day - timedelta(days=window_days)).timestamp())
-                epoch_to = int((day + timedelta(days=window_days)).timestamp())
+                epoch_to = int((day + timedelta(days=after + 1)).timestamp()) - 1
                 rows = con.execute(
                     f"SELECT {cols} FROM articles "
                     "WHERE ticker=? AND published_epoch BETWEEN ? AND ? AND published_epoch > 0",
@@ -148,3 +154,23 @@ class NewsCache:
     def count(self) -> int:
         with self._connect() as con:
             return con.execute("SELECT COUNT(*) FROM articles").fetchone()[0]
+
+    def all_articles_full(self) -> List[Dict]:
+        """ALLE gecachten Artikel mit vollständigem Inhalt (inkl. `summary` und
+        `published_epoch`) — im Unterschied zu `all_articles()`, das für die Debug-
+        Tabelle nur Anzeigespalten liefert. Grundlage für einen Neuaufbau des
+        Vektorindex aus dem Cache heraus (siehe rebuild_index.py): der Cache bleibt
+        die kanonische Quelle, FAISS/metadata.pkl ist ein daraus abgeleiteter Index."""
+        cols = "link, ticker, title, summary, published, published_epoch, source, indexed"
+        with self._connect() as con:
+            rows = con.execute(f"SELECT {cols} FROM articles").fetchall()
+        keys = cols.replace(" ", "").split(",")
+        return [dict(zip(keys, r)) for r in rows]
+
+    def delete_by_source(self, source: str) -> int:
+        """Löscht alle Artikel EINER Quelle (z. B. um sie nach einem Fetcher-Umbau neu
+        zu ziehen, ohne andere Quellen im Cache zu verlieren). Gibt die Anzahl der
+        gelöschten Zeilen zurück."""
+        with self._connect() as con:
+            cur = con.execute("DELETE FROM articles WHERE source=?", (source,))
+            return cur.rowcount

@@ -1,9 +1,25 @@
 import os
 import time
 import sqlite3
+import logging
 import pandas as pd
 import yfinance as yf
 from datetime import datetime, timedelta
+
+logger = logging.getLogger(__name__)
+
+# Sparmodus (rag/config.py::SAVING_MODE): beim Start des Dashboards KEINE
+# yfinance-Netzaufrufe. Der persistente Kurs-Cache (price_cache.db) deckt das
+# feststehende Portfolio vollständig ab; die RAG-/LLM-/RAGAS-Pfade brauchen nur
+# daraus abgeleitete Kennzahlen und die Anomalieliste. Netzverzicht spart die
+# ~20 kleinen Nachhol-/Splits-/Kurs-Requests, die den Start um 5–15 s verzögern.
+# Als Modul-Attribut gelesen (rag_config.SAVING_MODE), damit ein Laufzeit-Override
+# in Testskripten durchschlägt — wie in callbacks/naive_llm.py.
+from rag import config as rag_config
+
+
+def _network_allowed() -> bool:
+    return not rag_config.SAVING_MODE
 
 # Einfacher In-Memory-TTL-Cache für yfinance-Aufrufe. Lebt für die Dauer des
 # laufenden Prozesses (python dashboard.py) — ein Browser-Refresh (F5) muss
@@ -39,10 +55,22 @@ def _price_db():
                 "(ticker TEXT, date TEXT, close REAL, PRIMARY KEY (ticker, date))")
     con.execute("CREATE TABLE IF NOT EXISTS coverage "
                 "(ticker TEXT PRIMARY KEY, min_date TEXT, max_date TEXT)")
+    # Split-Historie persistent (wie prices): Splits vergangener Tage sind
+    # unveränderlich. `fetched` = Tag des letzten Netzabrufs; ein leeres Ergebnis
+    # (Ticker ohne Splits) wird als eine Zeile mit ratio IS NULL vermerkt, damit
+    # es nicht bei jedem Start erneut angefragt wird.
+    con.execute("CREATE TABLE IF NOT EXISTS splits "
+                "(ticker TEXT, date TEXT, ratio REAL, fetched TEXT, "
+                "PRIMARY KEY (ticker, date))")
     return con
 
 
 def _fetch_and_store(con, ticker, start, end):
+    if not _network_allowed():
+        # Sparmodus: keine Nachhol-Fetches. Was im Cache liegt, wird geliefert;
+        # eine echte Lücke (neuer Ticker / neues Datum) fällt beim Leser auf.
+        logger.info(f"Sparmodus: yfinance-Fetch übersprungen ({ticker} {start}…{end})")
+        return
     hist = yf.Ticker(ticker).history(start=start, end=end)
     if hist.empty:
         return
@@ -97,9 +125,23 @@ def get_price_history_cached(ticker, start, end):
 
 
 def get_current_price(ticker):
-    """Aktueller Schlusskurs (period='1d'), gecacht."""
-    return _cached(f"current_price:{ticker}",
-                  lambda: yf.Ticker(ticker).history(period="1d")['Close'].iloc[-1])
+    """Aktueller Schlusskurs (period='1d'), gecacht.
+
+    Sparmodus: kein Netzaufruf — es wird der letzte im persistenten Kurs-Cache
+    vorhandene Schlusskurs geliefert (für die Positionstabelle völlig ausreichend,
+    der Tageskurs muss dort nicht sekundengenau sein)."""
+    def _fetch():
+        if not _network_allowed():
+            con = _price_db()
+            try:
+                row = con.execute(
+                    "SELECT close FROM prices WHERE ticker=? ORDER BY date DESC LIMIT 1",
+                    (ticker,)).fetchone()
+            finally:
+                con.close()
+            return row[0] if row else float("nan")
+        return yf.Ticker(ticker).history(period="1d")['Close'].iloc[-1]
+    return _cached(f"current_price:{ticker}", _fetch)
 
 
 def get_benchmark_history(ticker, start, end):
@@ -109,9 +151,44 @@ def get_benchmark_history(ticker, start, end):
 
 
 def _get_splits(ticker):
-    """Split-Historie eines Tickers, gecacht — von beiden adjust_*-Funktionen
-    gemeinsam genutzt (vorher wurde sie pro Position zweimal einzeln geholt)."""
-    return _cached(f"splits:{ticker}", lambda: yf.Ticker(ticker).splits)
+    """Split-Historie eines Tickers — In-Memory-gecacht UND persistent (splits-
+    Tabelle in price_cache.db). Von beiden adjust_*-Funktionen gemeinsam genutzt.
+
+    Der persistente Cache ist split-kritisch für den Sparmodus: die Anomalie-
+    Erkennung läuft auf einer Renditereihe, in die die split-bereinigte Stückzahl
+    eingeht (u. a. NVDA 10:1, 2024). Ohne korrekte Splits verschöbe sich die Reihe
+    und damit die erkannten Anomalien. Ein Cache-MISS holt die Splits daher AUCH
+    im Sparmodus einmalig vom Netz (ein Request je Ticker, danach nie wieder) —
+    im Gegensatz zu den Kurs-Nachhol-Fetches, die der Sparmodus strikt unterbindet.
+    Liegt der Ticker bereits persistent vor, gibt es keinen Netzaufruf."""
+    def _fetch():
+        con = _price_db()
+        try:
+            rows = con.execute(
+                "SELECT date, ratio FROM splits WHERE ticker=? ORDER BY date",
+                (ticker,)).fetchall()
+            if rows:
+                dated = [(pd.Timestamp(d), r) for d, r in rows if r is not None]
+                if not dated:
+                    return pd.Series(dtype="float64")  # bekannt: Ticker ohne Splits
+                idx, vals = zip(*dated)
+                return pd.Series(vals, index=pd.DatetimeIndex(idx))
+
+            splits = yf.Ticker(ticker).splits
+            today = datetime.now().strftime('%Y-%m-%d')
+            if splits is None or len(splits) == 0:
+                con.execute("INSERT OR REPLACE INTO splits VALUES (?,?,?,?)",
+                            (ticker, "1900-01-01", None, today))
+            else:
+                con.executemany(
+                    "INSERT OR REPLACE INTO splits VALUES (?,?,?,?)",
+                    [(ticker, d.strftime('%Y-%m-%d'), float(r), today)
+                     for d, r in splits.items()])
+            con.commit()
+            return splits if splits is not None else pd.Series(dtype="float64")
+        finally:
+            con.close()
+    return _cached(f"splits:{ticker}", _fetch)
 
 
 def fetch_price_at_date(ticker, date):
@@ -159,11 +236,12 @@ def adjust_price_for_splits(ticker, price, date):
     return adjusted_price
 
 
-def build_pme_positions(positions, benchmark_prices, benchmark_ticker='SPY'):
-    """Public Market Equivalent (PME): simuliert für jede Position einen Kauf zum
-    selben buy_date im Benchmark-Index, mit demselben investierten Dollarbetrag,
-    damit die Kapitalzufluss-Zeitpunkte des Portfolios und des Benchmarks übereinstimmen."""
-    pme_positions = []
+def build_synthetic_benchmark_positions(positions, benchmark_prices, benchmark_ticker='SPY'):
+    """Zahlungsstromgleiche synthetische Indexposition: simuliert für jede Position
+    einen Kauf zum selben buy_date im Benchmark-Index, mit demselben investierten
+    Dollarbetrag, damit die Kapitalzufluss-Zeitpunkte des Portfolios und des
+    Benchmarks übereinstimmen."""
+    benchmark_positions = []
     for pos in positions:
         buy_date = pd.to_datetime(pos['buy_date'])
         if benchmark_prices.index.tz is not None and buy_date.tz is None:
@@ -174,12 +252,12 @@ def build_pme_positions(positions, benchmark_prices, benchmark_ticker='SPY'):
             continue
 
         invested_amount = pos['shares'] * pos['buy_price']
-        pme_positions.append({
+        benchmark_positions.append({
             'ticker': benchmark_ticker,
             'shares': invested_amount / price_at_buy,
             'buy_date': pos['buy_date']
         })
-    return pme_positions
+    return benchmark_positions
 
 
 def calculate_portfolio_timeseries(positions):

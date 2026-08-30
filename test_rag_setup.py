@@ -180,11 +180,22 @@ else:
         win_end = datetime(2024, 5, 5)
         articles = edgar.fetch("AAPL", limit=5, start=win_start, end=win_end)
         assert articles, "Keine EDGAR-Filings für AAPL im bekannten Q2-FY24-Fenster gefunden"
+        from rag.chunker import _is_boilerplate
+        eightk_articles = []
         for a in articles:
             d = datetime.fromisoformat(a["published"])
             assert win_start <= d <= win_end, f"Filing-Datum außerhalb des Fensters: {a['published']}"
             assert len(a["summary"]) > 200, "Dokumenttext verdächtig kurz — XBRL-Rauschen statt Fließtext?"
             assert "us-gaap:" not in a["summary"][:500], "XBRL-Tag-Rauschen im extrahierten Text (ix:header-Filter kaputt?)"
+            if "8-K filing" in a["title"]:
+                eightk_articles.append(a)
+        # 8-K: mindestens EINES sollte das Pressemitteilungs-Exhibit sein, nicht die
+        # Formularhülle (siehe news/sec_edgar.py::_find_exhibit_doc) — NICHT jedes: ein
+        # 8-K kann auch ein genuin juristisches Exhibit anhängen (z. B. eine
+        # Vergleichs-Mitteilung), das legitim boilerplate-dicht ist.
+        if eightk_articles:
+            assert any(not _is_boilerplate(a["summary"]) for a in eightk_articles), \
+                "Alle 8-K-Artikel wirken wie reine Formularhülle (Exhibit-Fetch fehlgeschlagen?)"
         print(f"OK  {len(articles)} Filing(s) im Fenster, z. B. [{articles[0]['published']}] {articles[0]['title'][:70]}")
 
         # Chunking-Beleg: ein langes EDGAR-Dokument wird in MEHRERE Chunks gesplittet
@@ -211,7 +222,10 @@ print("\n[11] Alpha Vantage — historisches Retrieval (nur falls Key gesetzt) .
 from news.alpha_vantage import AlphaVantageNewsSource
 
 av = AlphaVantageNewsSource()
-if not av._enabled:
+if av._quota_lock:
+    print("SKIP  Kontingentschutz aktiv (Sparmodus aus oder "
+          "RAGConfig.alpha_vantage_enabled=False) — kein Request an Alpha Vantage")
+elif not av._enabled:
     print("SKIP  ALPHAVANTAGE_API_KEY nicht gesetzt — AlphaVantageNewsSource-Test übersprungen")
 else:
     try:

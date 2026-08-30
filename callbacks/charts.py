@@ -7,7 +7,7 @@ from dash import Input, Output, html
 from utils.finance import (
     calculate_portfolio_timeseries,
     adjust_shares_for_splits,
-    build_pme_positions,
+    build_synthetic_benchmark_positions,
     get_current_price,
     get_benchmark_history,
 )
@@ -262,18 +262,18 @@ def register(app):
             try:
                 spy_hist = get_benchmark_history('SPY', df['Date'].min(), df['Date'].max())
                 if not spy_hist.empty:
-                    # Public Market Equivalent (PME)-Anpassung: simuliert die gleichen
+                    # Zahlungsstromgleicher Benchmark: simuliert die gleichen
                     # Kapitalzuflüsse (buy_date, investierter Betrag) im S&P 500, damit
                     # Total Return/Sortino/Sharpe zeitgleich und fair vergleichbar sind.
-                    pme_positions = build_pme_positions(positions, spy_hist['Close'])
-                    pme_price_df = spy_hist['Close'].to_frame(name='SPY')
-                    twr_pme = calculate_twr_metrics(pme_positions, pme_price_df)
+                    benchmark_positions = build_synthetic_benchmark_positions(positions, spy_hist['Close'])
+                    benchmark_price_df = spy_hist['Close'].to_frame(name='SPY')
+                    twr_benchmark = calculate_twr_metrics(benchmark_positions, benchmark_price_df)
 
-                    if twr_pme is not None:
-                        spy_total_return = twr_pme['total_return']
-                        spy_sortino = twr_pme['sortino']
-                        spy_rolling_sharpe = twr_pme['rolling_sharpe']
-                        spy_returns_for_chart = twr_pme['returns']
+                    if twr_benchmark is not None:
+                        spy_total_return = twr_benchmark['total_return']
+                        spy_sortino = twr_benchmark['sortino']
+                        spy_rolling_sharpe = twr_benchmark['rolling_sharpe']
+                        spy_returns_for_chart = twr_benchmark['returns']
                     else:
                         spy_returns_for_chart = spy_hist['Close'].pct_change().dropna()
                         spy_total_return = (spy_hist['Close'].iloc[-1] / spy_hist['Close'].iloc[0] - 1) * 100
@@ -326,11 +326,11 @@ def register(app):
                                 html.H3(f"{total_return:.2f}%", style={'color': '#f0f6fc', 'fontWeight': '700'})
                             ])], className="card-custom")], width=3),
                             dbc.Col([dbc.Card([dbc.CardBody([
-                                html.H5("S&P 500 Return (PME)", className="text-muted"),
+                                html.H5("S&P 500 Return (angeglichen)", className="text-muted"),
                                 html.H3(f"{spy_total_return:.2f}%", style={'color': '#8b949e', 'fontWeight': '700'})
                             ])], className="card-custom")], width=3),
                             dbc.Col([dbc.Card([dbc.CardBody([
-                                html.H5("Outperformance (PME)", className="text-muted"),
+                                html.H5("Outperformance (angeglichen)", className="text-muted"),
                                 html.H3(f"{portfolio_vs_spy:+.2f}%",
                                        style={'color': '#28a745' if portfolio_vs_spy > 0 else '#dc3545', 'fontWeight': '700'})
                             ])], className="card-custom")], width=3),
@@ -346,7 +346,7 @@ def register(app):
                                        style={'color': '#f0f6fc', 'fontWeight': '700'})
                             ])], className="card-custom")], width=3),
                             dbc.Col([dbc.Card([dbc.CardBody([
-                                html.H5("S&P 500 Sortino Ratio (PME)", className="text-muted"),
+                                html.H5("S&P 500 Sortino Ratio (angeglichen)", className="text-muted"),
                                 html.H3(f"{spy_sortino:.3f}" if not np.isnan(spy_sortino) else "N/A",
                                        style={'color': '#8b949e', 'fontWeight': '700'})
                             ])], className="card-custom")], width=3),
@@ -356,7 +356,7 @@ def register(app):
                                        style={'color': '#f0f6fc', 'fontWeight': '700'})
                             ])], className="card-custom")], width=3),
                             dbc.Col([dbc.Card([dbc.CardBody([
-                                html.H5("S&P 500 Sharpe Ratio (PME)", className="text-muted"),
+                                html.H5("S&P 500 Sharpe Ratio (angeglichen)", className="text-muted"),
                                 html.H3(f"{spy_sharpe_current:.3f}" if not np.isnan(spy_sharpe_current) else "N/A",
                                        style={'color': '#8b949e', 'fontWeight': '700'})
                             ])], className="card-custom")], width=3),

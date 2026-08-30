@@ -83,6 +83,9 @@ def get_sources() -> List[NewsSource]:
     Sıralama önemli değil (pipeline hepsinden toplar), ama Yahoo en ucuz/hızlı
     olduğu için önce dener. SEC EDGAR ve Alpha Vantage anahtar/ayar yoksa kendini
     otomatik devre dışı bırakır (bkz. .env.example) — sistem yine de çalışır.
+    Alpha Vantage ayrıca RAGConfig.alpha_vantage_enabled bayrağıyla kontenjan
+    koruması (Kontingentschutz) altındadır: bayrak kapalıyken kaynak hiçbir
+    istek göndermez.
     """
     from news.yahoo_fetcher import YahooRSSSource
     from news.sec_edgar import SECEdgarSource
@@ -95,3 +98,37 @@ def get_sources() -> List[NewsSource]:
                        max_document_chars=DEFAULT_CONFIG.max_document_chars),
         AlphaVantageNewsSource(),
     ]
+
+
+def clean_url(url: str) -> str:
+    """Entfernt Tracking-/Session-Parameter aus einer Artikel-URL.
+
+    Begruendung: Die URL wandert als `Link:`-Zeile in den Prompt. Bei manchen
+    Nachrichtenportalen bestehen die Query-Parameter fast vollstaendig aus
+    Tracking-Tokens (gaa_at, gaa_sig, ...) und werden dadurch laenger als der
+    Artikeltext selbst — reiner Token-Verbrauch ohne Informationswert fuer das
+    Modell. Der Pfad bleibt erhalten, die Quelle also identifizierbar und
+    zitierbar; nur der Parameteranteil faellt weg.
+    """
+    if not url:
+        return ""
+    base = url.split("?", 1)[0].split("#", 1)[0]
+    return base or url
+
+
+def source_label(link: str, source: str) -> str:
+    """Kaynak etiketi: prompt'taki `Source:` satırına yazılacak değer.
+
+    Alpha Vantage bir haber AGREGATÖRÜ; `source` alanı ("alpha_vantage") gerçek
+    yayın organı değil ve modele kaynak olarak verilirse doğrulanamaz bir ad
+    üretir. Gerçek yayıncı yalnızca URL'nin alan adında saklı — onu çıkarıp
+    döndürüyoruz (marketwatch.com, nytimes.com, ...). SEC EDGAR ise anlamlı bir
+    kaynak adı, olduğu gibi bırakılır. Link yoksa `source` değerine düşer.
+    """
+    if source == "sec_edgar":
+        return "SEC EDGAR filing"
+    base = clean_url(link)
+    if not base:
+        return source
+    netloc = base.split("://", 1)[-1].split("/", 1)[0]
+    return netloc[4:] if netloc.startswith("www.") else (netloc or source)

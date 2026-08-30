@@ -13,7 +13,7 @@ from typing import List, Dict, Optional, Set
 import logging
 from datetime import datetime, timedelta
 
-from news.base import get_sources, published_to_epoch
+from news.base import get_sources, published_to_epoch, source_label
 from rag.config import RAGConfig, DEFAULT_CONFIG
 from rag.cache import NewsCache
 from rag.chunker import NewsChunker
@@ -160,15 +160,24 @@ class RAGPipeline:
                          date_to: Optional[datetime] = None) -> List[Dict]:
         """Retrieval mit optionaler Metadaten-Filterung (Ticker + Zeitfenster).
 
-        Bei aktiven Filtern wird ein größerer Kandidaten-Pool geholt und danach
-        gefiltert, damit trotz Filterung möglichst top_k Treffer übrig bleiben.
+        FAISS kennt keine native Metadaten-Filterung; gefiltert wird daher nachgelagert
+        in Python. Der Kandidaten-Pool umfasst bei aktiven Filtern deshalb den GESAMTEN
+        Index: Ein fester, kleinerer Pool würde die Filter nur auf die global
+        ähnlichsten Chunks anwenden. Da alle Anomalien denselben generischen
+        Suchtext verwenden, ist dieser globale Pool für jede Anomalie identisch —
+        Ereignisse, deren Dokumente nicht zufällig darin liegen, gingen leer aus,
+        obwohl passende Dokumente im Index vorhanden sind. Erst der vollständige Pool
+        macht die Filterung erschöpfend; die Ähnlichkeit ordnet danach innerhalb der
+        gefilterten Menge. Bei der Indexgröße dieses Prototyps ist die exakte Suche
+        über alle Vektoren rechnerisch unkritisch.
         """
         top_k = top_k or self.config.top_k
         logger.info(f"Retrieving for query: {query[:60]}... "
                     f"(ticker={filter_ticker}, from={date_from}, to={date_to})")
 
         has_filter = bool(filter_ticker or date_from or date_to)
-        pool = self.config.filter_pool_size if has_filter else top_k
+        pool = max(self.vectorstore.count_documents(),
+                   self.config.filter_pool_size) if has_filter else top_k
 
         query_embedding = self.embedder.embed_text(query)
         results = self.vectorstore.query_text(query, query_embedding, top_k=pool)
@@ -191,16 +200,55 @@ class RAGPipeline:
                 filtered.append(r)
             results = filtered
 
-        return results[:top_k]
+        return self._apply_sec_slots(results, top_k)
+
+    def _apply_sec_slots(self, results: List[Dict], top_k: int) -> List[Dict]:
+        """Reserviert unter den top_k Treffern die besten config.sec_slots
+        SEC-EDGAR-Chunks (siehe RAGConfig.sec_slots/preferred_sections).
+
+        `results` ist bereits nach Distanz sortiert (kommt so aus FAISS). Die
+        SEC-Kandidaten werden daraus VORAB behalten (Reihenfolge bleibt Distanz),
+        dann per `preferred_sections` stabil umsortiert, sodass Kandidaten aus
+        bevorzugten Abschnitten vorgezogen werden, ohne die Distanzordnung
+        innerhalb eines Abschnitts zu verlieren. Gibt es keine oder zu wenige
+        SEC-Treffer im (bereits ticker-/zeitgefilterten) `results`, entspricht
+        das Ergebnis exakt dem bisherigen `results[:top_k]`.
+        """
+        sec_slots = self.config.sec_slots
+        if sec_slots <= 0:
+            return results[:top_k]
+
+        sec_hits = [r for r in results if r["metadata"].get("source") == "sec_edgar"]
+        if not sec_hits:
+            return results[:top_k]
+
+        preferred = self.config.preferred_sections
+        if preferred:
+            sec_hits = sorted(
+                sec_hits,
+                key=lambda r: preferred.index(r["metadata"].get("section", ""))
+                if r["metadata"].get("section", "") in preferred else len(preferred),
+            )
+
+        reserved = sec_hits[:sec_slots]
+        reserved_keys = {(r["metadata"].get("link", ""), r["text"]) for r in reserved}
+        remaining = [r for r in results if (r["metadata"].get("link", ""), r["text"]) not in reserved_keys]
+
+        fill_count = max(top_k - len(reserved), 0)
+        return (reserved + remaining[:fill_count])[:top_k]
 
     def retrieve_for_anomaly(self, query: str, anomaly: Dict,
                              top_k: Optional[int] = None) -> List[Dict]:
         """Retrieval, das gezielt auf ein Anomalie-Ereignis abgestimmt ist.
 
-        Filtert strikt nach dem verantwortlichen Ticker UND einem Zeitfenster
-        (± config.anomaly_window_days) um das Anomaliedatum. KEIN Fallback: gibt es im
-        Fenster keine passende Nachricht, wird eine leere Liste zurückgegeben (kein
-        Rückgriff auf aktuelle, themenfremde Nachrichten).
+        Filtert strikt nach dem verantwortlichen Ticker UND einem ASYMMETRISCHEN
+        Zeitfenster um das Anomaliedatum: config.anomaly_window_days rückwärts, aber
+        nur config.anomaly_window_days_after vorwärts. Ein Dokument, das der
+        Kursbewegung vorausgeht oder ihr um höchstens einen Tag folgt, kann sie erklärt
+        haben; ein Dokument, das erst deutlich später erscheint, kann nur eine Folge
+        beschreiben, nicht die Ursache (Look-Ahead-Bias) — siehe RAGConfig. KEIN
+        Fallback: gibt es im Fenster keine passende Nachricht, wird eine leere Liste
+        zurückgegeben (kein Rückgriff auf aktuelle, themenfremde Nachrichten).
         """
         top_k = top_k or self.config.top_k
         ticker = anomaly.get("responsible_ticker") or None
@@ -210,8 +258,12 @@ class RAGPipeline:
         if date_str:
             try:
                 d = datetime.fromisoformat(str(date_str)[:10])
-                w = timedelta(days=self.config.anomaly_window_days)
-                date_from, date_to = d - w, d + w
+                date_from = d - timedelta(days=self.config.anomaly_window_days)
+                # Bis zum ENDE des letzten erlaubten Vorwärtstages (nicht dessen
+                # Mitternachtsbeginn) — sonst wäre der Vorwärtstag durch die
+                # Zeitstempel-Grenze faktisch ausgeschlossen statt eingeschlossen.
+                date_to = (d + timedelta(days=self.config.anomaly_window_days_after + 1)
+                          - timedelta(seconds=1))
             except ValueError:
                 logger.warning(f"Unparsbares Anomaliedatum: {date_str}")
 
@@ -238,17 +290,21 @@ class RAGPipeline:
         for i, chunk in enumerate(retrieved_chunks, 1):
             metadata = chunk["metadata"]
             title = metadata.get("title", "")
-            source = metadata.get("source", "")
             ticker = metadata.get("ticker", "")
-            link = metadata.get("link", "")
-            published = metadata.get("published", "")
+            # `Source:`-Zeile = echter Publisher (aus der URL-Domain), nicht der
+            # Aggregator-Name "alpha_vantage" — sonst nennt das Modell als Quelle
+            # einen nicht verifizierbaren Bezeichner (siehe news.base.source_label).
+            # Die volle URL wird NICHT in den Prompt geschrieben: sie kostet
+            # Prompt-Budget, sagt dem Modell aber nichts über die Domain hinaus;
+            # der klickbare Link steht in der Quellenliste der UI.
+            source = source_label(metadata.get("link", ""), metadata.get("source", ""))
+            published = metadata.get("published", "")[:10]  # Datum genügt, Uhrzeit ist Rauschen
             text = chunk["text"]
 
             part = f"""
 [Source {i}] {ticker} - {title}
 Published: {published}
 Source: {source}
-Link: {link}
 Content: {text}
 ---"""
             if total_length + len(part) > max_chars:

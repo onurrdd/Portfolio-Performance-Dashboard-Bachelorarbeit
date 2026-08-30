@@ -71,6 +71,12 @@ class FAISSVectorStore:
                 "published": chunk.get("published", ""),
                 "published_epoch": chunk.get("published_epoch", 0),
                 "source": chunk.get("source", ""),
+                # Abschnitt des Ursprungsdokuments ("" bei Dokumenten ohne
+                # erkennbare Abschnittsmarker) — siehe rag/chunker.py::_tag_sections.
+                # Die Filterung selbst geschieht bereits beim Chunking; hier
+                # mitgefuehrt, damit die Herkunft eines Treffers nachvollziehbar
+                # bleibt und spaeter nach Abschnitt gewichtet werden kann.
+                "section": chunk.get("section", ""),
                 "chunk_index": chunk.get("chunk_index", 0),
             })
 

@@ -13,6 +13,9 @@ from typing import Dict, List, Optional
 
 import requests
 
+from rag.config import DEFAULT_CONFIG
+from rag import config as rag_config  # Sparmodus-Schalter, als Attribut gelesen
+
 logger = logging.getLogger(__name__)
 
 _URL = "https://www.alphavantage.co/query"
@@ -27,15 +30,27 @@ class AlphaVantageNewsSource:
 
     def __init__(self):
         self._api_key = os.environ.get("ALPHAVANTAGE_API_KEY")
-        self._enabled = bool(self._api_key)
-        if not self._api_key:
+        # Kontingentschutz hat Vorrang vor dem Key: die Quelle geht nur ans Netz,
+        # wenn BEIDES gilt — der Sparmodus begrenzt die Anomalieliste ohnehin auf
+        # wenige Fälle (rag_config.SAVING_MODE) UND der harte Schalter ist an
+        # (RAGConfig.alpha_vantage_enabled). Ein Vollmodus-Lauf über alle Anomalien
+        # würde das Tageskontingent (25/Tag) sprengen und holt AV-Inhalte daher
+        # ausschließlich aus dem Cache.
+        self._quota_lock = not (rag_config.SAVING_MODE and DEFAULT_CONFIG.alpha_vantage_enabled)
+        self._enabled = bool(self._api_key) and not self._quota_lock
+        if self._quota_lock:
+            logger.info("AlphaVantageNewsSource deaktiviert (Sparmodus aus oder "
+                        "RAGConfig.alpha_vantage_enabled=False) — Kontingentschutz, "
+                        "es wird keine Anfrage gesendet")
+        elif not self._api_key:
             logger.warning("ALPHAVANTAGE_API_KEY nicht gesetzt — AlphaVantageNewsSource deaktiviert "
                           "(siehe .env.example)")
 
     def fetch(self, ticker: str, limit: int = 10,
               start: Optional[datetime] = None, end: Optional[datetime] = None) -> List[Dict]:
         if not self._enabled or start is None or end is None:
-            # Ohne Zeitfenster kein sinnvoller Query; ohne Key ist die Quelle inaktiv.
+            # Ohne Zeitfenster kein sinnvoller Query; ohne Key bzw. bei aktivem
+            # Kontingentschutz ist die Quelle inaktiv.
             return []
 
         params = {

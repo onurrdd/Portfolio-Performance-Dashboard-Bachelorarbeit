@@ -41,28 +41,58 @@ Konkretheit der FORMULIERUNG, nicht ihr Wahrheitsgehalt.
 import os
 import json
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 
-from callbacks.naive_llm import GENERATOR_MODEL, ANOMALY_PROMPT_SAFE_MODE, build_portfolio_prompt
+from callbacks.naive_llm import (GENERATOR_MODEL, ANOMALY_PROMPT_SAFE_MODE,
+                                 build_portfolio_prompt, llm_chat_with_retry,
+                                 make_llm_client, llm_base_url, llm_api_key,
+                                 LLM_PROVIDER, GENERATOR_KNOWLEDGE_CUTOFF,
+                                 select_prompt_anomalies)
+from rag import config as rag_config  # Sparmodus-Schalter, als Attribut gelesen
 
 logger = logging.getLogger(__name__)
 
 # Judge = Generator (bewusst identisch) — siehe Docstring oben.
 JUDGE_MODEL = GENERATOR_MODEL
-GROQ_OPENAI_BASE_URL = "https://api.groq.com/openai/v1"
+# Anbieter-Endpunkt/-Schlüssel kommen zentral aus callbacks/naive_llm.py
+# (LLM_PROVIDER) — Groq und OpenRouter bedienen denselben Modellnamen über
+# dieselbe OpenAI-kompatible Schnittstelle.
+#
+# GENERATOR_KNOWLEDGE_CUTOFF ist eine Eigenschaft des Generator-Modells und wohnt
+# daher in callbacks/naive_llm.py; hier nur importiert (Vor/Nach-Cutoff-Etikett).
 
-# Wissensstand des Generator-Modells (openai/gpt-oss-120b), laut offiziellem Model
-# Card ca. Juni 2024 (Quelle: OpenAI gpt-oss Model Card, 05.08.2025; einzelne
-# Sekundärquellen nennen Mai/Juli 2024 — Datum ist daher als ungefähr zu behandeln
-# und im Thesistext entsprechend zu relativieren). Dient nur der Vor/Nach-Cutoff-
-# Etikettierung der Stichprobe, nicht als exakte Wahrheitsgrenze.
-GENERATOR_KNOWLEDGE_CUTOFF = "2024-06-01"
-
-TOP_K = 3  # identisch zur Produktions-Retrieval (siehe callbacks/rag.py::_collect_rag_context)
+TOP_K = 3  # identisch zur Anwendung (callbacks/rag.py::RETRIEVAL_TOP_K)
 RETRIEVAL_QUERY = "reason for the stock price move, earnings, guidance or company news"  # dito
 
 GROUND_TRUTH_PATH = "data/ground_truth.json"
 RESULTS_DIR = "data"
+
+# Zahl der gleichzeitig laufenden LLM-Aufrufe. Je Anomalie fallen rund vierzehn
+# Aufrufe an (zwei Antworten, zwei Klassifikationen, zehn RAGAS-Aufrufe); streng
+# nacheinander abgearbeitet dauert ein Lauf ueber ein ganzes Portfolio Stunden,
+# ohne dass die Rechenlast dies erforderte — die Zeit vergeht in der Wartezeit auf
+# den Anbieter, nicht in lokaler Rechnung. Der Wert ist ueber die Umgebung
+# einstellbar, damit ein Anbieter mit engem Anfragelimit ohne Codeaenderung wieder
+# auf sequenzielle Abarbeitung (1) zurueckgestellt werden kann.
+EVAL_MAX_WORKERS = int(os.environ.get("EVAL_MAX_WORKERS", "8"))
+
+
+def _run_parallel(tasks):
+    """Fuehrt eine Liste argumentloser Aufrufe nebenlaeufig aus und wartet auf alle.
+
+    Die Aufgaben schreiben ihr Ergebnis selbst in das jeweilige Stichprobenobjekt;
+    die Reihenfolge der Stichprobe bleibt dadurch unabhaengig davon, in welcher
+    Reihenfolge die Antworten eintreffen. Faellt ein Aufruf mit einer Ausnahme aus,
+    wird sie beim Einsammeln erneut ausgeloest — wie bei sequenzieller Abarbeitung.
+    """
+    if EVAL_MAX_WORKERS <= 1:
+        for task in tasks:
+            task()
+        return
+    with ThreadPoolExecutor(max_workers=EVAL_MAX_WORKERS) as pool:
+        for future in [pool.submit(t) for t in tasks]:
+            future.result()
 
 
 def _single_stock_anomalies(analysis_data):
@@ -77,6 +107,17 @@ def _single_stock_anomalies(analysis_data):
         b for b in (analysis_data or {}).get('active_return_breaks', [])
         if b.get('concentration') == 'Hisseye özgü' and b.get('responsible_ticker')
     ]
+
+
+def _eval_anomalies(analysis_data):
+    """Anomalien, die in die Evaluation eingehen. Im Sparmodus (rag_config.SAVING_MODE)
+    exakt die im Prompt gelistete Auswahl (select_prompt_anomalies) — dieselbe kleine,
+    über den Cutoff ausgewogene Menge wie in den LLM-Tabs, damit ein RAGAS-Lauf
+    denselben Bruchteil des Kontingents kostet. Im Vollmodus alle Einzeltitel-
+    Anomalien (je Anomalie ein eigener Aufruf, siehe Modul-Docstring)."""
+    if rag_config.SAVING_MODE:
+        return select_prompt_anomalies(analysis_data)
+    return _single_stock_anomalies(analysis_data)
 
 
 def _load_ground_truth():
@@ -95,14 +136,15 @@ def _load_ground_truth():
 def build_eval_samples(rag_pipeline, analysis_data):
     """Baut eine RAGAS-Stichprobe PRO Anomalie (Frage/Kontexte/Status).
 
-    Nur Einzeltitel-Anomalien (siehe _single_stock_anomalies) — identisch zur
-    Produktionslogik. Kontext-Retrieval ist eins zu eins die Produktionsfunktion
-    (gleiche Query, gleiches top_k), damit die Evaluation misst, was der Nutzer
-    tatsächlich als Kontext bekommt.
+    Nur Einzeltitel-Anomalien (siehe _eval_anomalies) — identisch zur
+    Produktionslogik, im Sparmodus auf die im Prompt gelistete Auswahl beschränkt.
+    Kontext-Retrieval ist eins zu eins die Produktionsfunktion (gleiche Query,
+    gleiches top_k), damit die Evaluation misst, was der Nutzer tatsächlich als
+    Kontext bekommt.
     """
     ground_truth = _load_ground_truth()
     samples = []
-    for b in _single_stock_anomalies(analysis_data):
+    for b in _eval_anomalies(analysis_data):
         ticker = b.get('responsible_ticker')
         date_str = b.get('date')
         own_return = b.get('ticker_own_return_pct', 0) or 0
@@ -137,14 +179,13 @@ def generate_answer(rag_pipeline, analysis_data, sample):
     wie Naive-LLM/RAG-LLM (build_portfolio_prompt), aber auf diese eine Anomalie
     beschränkt (active_return_breaks = [sample['anomaly']]), damit Faithfulness die
     Antwort gegen exakt die dafür abgerufenen Kontexte prüfen kann."""
-    from groq import Groq
-
     single_data = {**(analysis_data or {}), "active_return_breaks": [sample["anomaly"]]}
     news_context = rag_pipeline.format_context_for_llm(sample["chunks"], max_tokens=2000)
     prompt = build_portfolio_prompt(single_data, news_context=news_context or None)
 
-    client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
-    response = client.chat.completions.create(
+    client = make_llm_client()
+    response = llm_chat_with_retry(
+        client,
         messages=[{"role": "user", "content": prompt}],
         model=GENERATOR_MODEL,
         max_tokens=4096,
@@ -157,13 +198,12 @@ def generate_naive_answer(analysis_data, sample):
     den Naive-LLM-Tab (build_portfolio_prompt ohne news_context). Wird für JEDE
     Anomalie erzeugt, auch wenn RAG keinen Kontext gefunden hat (status='no_context'):
     der Vergleich braucht in diesem Fall gerade die Gegenüberstellung."""
-    from groq import Groq
-
     single_data = {**(analysis_data or {}), "active_return_breaks": [sample["anomaly"]]}
     prompt = build_portfolio_prompt(single_data)
 
-    client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
-    response = client.chat.completions.create(
+    client = make_llm_client()
+    response = llm_chat_with_retry(
+        client,
         messages=[{"role": "user", "content": prompt}],
         model=GENERATOR_MODEL,
         max_tokens=4096,
@@ -209,12 +249,15 @@ def classify_explanation(question, answer, api_key):
 
     Fehlertolerant (Timeout/JSON-Parse-Fehler): liefert {"specificity": None,
     "citation_type": None} statt die gesamte Auswertung abzubrechen.
-    """
-    from groq import Groq
 
+    `api_key` wird nicht mehr direkt verwendet (Provider-Auswahl läuft zentral über
+    make_llm_client/LLM_PROVIDER) — der Parameter bleibt aus Kompatibilität zur
+    bestehenden Aufrufsignatur erhalten.
+    """
     try:
-        client = Groq(api_key=api_key)
-        response = client.chat.completions.create(
+        client = make_llm_client()
+        response = llm_chat_with_retry(
+            client,
             messages=[{"role": "user", "content": _CLASSIFY_PROMPT.format(question=question, answer=answer)}],
             model=JUDGE_MODEL,
             max_tokens=1024,
@@ -259,13 +302,14 @@ def run_ragas_evaluation(rag_pipeline, analysis_data, api_key):
        optional Context Recall) — NUR für Anomalien mit abgerufenem Kontext
        (status='ok'), unverändert gegenüber der ursprünglichen Version.
     2) Naive-LLM-vs-RAG-LLM-Vergleich (Spezifität, Zitierbarkeit; siehe
-       classify_explanation) — für JEDE Einzeltitel-Anomalie, unabhängig vom Kontext-
-       Status, weil Naive-LLM ohnehin nie Kontext braucht und der Fall "RAG fand
-       keinen Kontext" selbst ein Vergleichsergebnis ist (RAG degradiert dann zu
-       Naive).
+       classify_explanation) — für JEDE Anomalie der Stichprobe (im Sparmodus die
+       Auswahl, sonst alle Einzeltitel-Anomalien), unabhängig vom Kontext-Status,
+       weil Naive-LLM ohnehin nie Kontext braucht und der Fall "RAG fand keinen
+       Kontext" selbst ein Vergleichsergebnis ist (RAG degradiert dann zu Naive).
 
     Rückgabe: {"samples": [...], "aggregate": {...}, "comparison": {...},
-               "config": {...}, "n_skipped": int, "timestamp": iso-str}
+               "group_sizes": {...}, "config": {...}, "n_skipped": int,
+               "timestamp": iso-str}
     """
     import numpy as np
     from ragas import evaluate, EvaluationDataset, SingleTurnSample, RunConfig
@@ -277,20 +321,34 @@ def run_ragas_evaluation(rag_pipeline, analysis_data, api_key):
     evaluable = [s for s in samples if s["status"] == "ok"]
     n_skipped = len(samples) - len(evaluable)
 
-    # 1) Antworten erzeugen — RAG- UND Naive-Antwort für ALLE Anomalien (sequenziell,
-    # Groq-Free-Tier-freundlich). RAG-Antwort ist bei status='no_context' identisch
-    # zur Naive-Antwort im Prompt-Aufbau (news_context=None in beiden Fällen) — der
-    # Vergleich zeigt dann konsequenterweise Konvergenz statt eines Fehlers.
-    for s in samples:
-        s["rag_answer"] = generate_answer(rag_pipeline, analysis_data, s)
-        s["naive_answer"] = generate_naive_answer(analysis_data, s)
+    # 1) Antworten erzeugen — RAG- UND Naive-Antwort für ALLE Anomalien. Die Aufrufe
+    # sind voneinander unabhängig und laufen deshalb nebenläufig (EVAL_MAX_WORKERS).
+    # RAG-Antwort ist bei status='no_context' identisch zur Naive-Antwort im
+    # Prompt-Aufbau (news_context=None in beiden Fällen) — der Vergleich zeigt dann
+    # konsequenterweise Konvergenz statt eines Fehlers.
+    def _answer_tasks():
+        for s in samples:
+            yield lambda s=s: s.__setitem__(
+                "rag_answer", generate_answer(rag_pipeline, analysis_data, s))
+            yield lambda s=s: s.__setitem__(
+                "naive_answer", generate_naive_answer(analysis_data, s))
+
+    _run_parallel(list(_answer_tasks()))
 
     # 2) Symmetrische Hakem-Klassifikation beider Antworten (siehe classify_explanation).
     # Eigenständig fehlertolerant — ein einzelner Klassifikationsfehler bricht die
-    # gesamte Auswertung nicht ab.
-    for s in samples:
-        s["rag_classification"] = classify_explanation(s["question"], s["rag_answer"], api_key)
-        s["naive_classification"] = classify_explanation(s["question"], s["naive_answer"], api_key)
+    # gesamte Auswertung nicht ab. Setzt Schritt 1 voraus und läuft deshalb erst
+    # danach, in sich aber ebenfalls nebenläufig.
+    def _classification_tasks():
+        for s in samples:
+            yield lambda s=s: s.__setitem__(
+                "rag_classification",
+                classify_explanation(s["question"], s["rag_answer"], api_key))
+            yield lambda s=s: s.__setitem__(
+                "naive_classification",
+                classify_explanation(s["question"], s["naive_answer"], api_key))
+
+    _run_parallel(list(_classification_tasks()))
 
     # 3) RAG-interne RAGAS-Metriken — NUR für Anomalien mit Kontext.
     if evaluable:
@@ -314,16 +372,24 @@ def run_ragas_evaluation(rag_pipeline, analysis_data, api_key):
         # (LLMDidNotFinishException) und damit zu NaN. "low" hält den Denkschritt kurz
         # und lässt genug Tokens für die eigentliche strukturierte Ausgabe übrig.
         raw_llm = ChatOpenAI(
-            model=JUDGE_MODEL, base_url=GROQ_OPENAI_BASE_URL,
-            api_key=api_key, temperature=0, max_tokens=4096,
+            model=JUDGE_MODEL, base_url=llm_base_url(),
+            api_key=llm_api_key(), temperature=0, max_tokens=4096,
             model_kwargs={"reasoning_effort": "low"},
         )
-        # max_workers=1 + Retries: Groq-Free-Tier-Rate-Limits (429) über ~9-10 Judge-
-        # Aufrufe je Anomalie. bypass_n=True: openai/gpt-oss-120b (Reasoning-Modell,
-        # via Groqs OpenAI-kompatiblem Endpoint) lehnt n>1 ab ("'n' : number must be
+        # max_workers: rund zehn Judge-Aufrufe je Anomalie, die voneinander
+        # unabhängig sind; sie laufen deshalb nebenläufig (siehe EVAL_MAX_WORKERS).
+        # Die Wiederholungen (max_retries) fangen vereinzelte Anfragebegrenzungen des
+        # Anbieters ab. bypass_n=True: openai/gpt-oss-120b (Reasoning-Modell, über
+        # einen OpenAI-kompatiblen Endpunkt) lehnt n>1 ab ("'n' : number must be
         # at most 1"); ResponseRelevancy würde sonst mit n=strictness aufrufen und
-        # scheitern — bypass_n erzwingt stattdessen sequenzielle Einzel-Aufrufe.
-        run_config = RunConfig(timeout=120, max_retries=8, max_wait=60, max_workers=1)
+        # scheitern — bypass_n erzwingt stattdessen einzelne Aufrufe.
+        # timeout: Ein einzelner Judge-Aufruf umfasst bei einem Reasoning-Modell
+        # zuerst einen unsichtbaren Denkschritt und erst danach die strukturierte
+        # Ausgabe; ueber einen vermittelnden Anbieter kommt die Routing-Latenz
+        # hinzu. Bei 120 s brachen einzelne Aufrufe reproduzierbar ab und lieferten
+        # NaN statt eines Messwerts — der Wert ist deshalb grosszuegig gesetzt.
+        run_config = RunConfig(timeout=300, max_retries=8, max_wait=60,
+                               max_workers=EVAL_MAX_WORKERS)
         judge = LangchainLLMWrapper(raw_llm, run_config=run_config, bypass_n=True)
 
         metrics = [Faithfulness(), ResponseRelevancy(), LLMContextPrecisionWithoutReference()]
@@ -339,17 +405,55 @@ def run_ragas_evaluation(rag_pipeline, analysis_data, api_key):
         for s, score in zip(evaluable, eval_result.scores):
             s["_ragas_score"] = score
 
+        # 3b) ZWEITER Durchgang: dieselbe Quellenbasis, aber die NAIVE Antwort als
+        # Response. Damit wird die Belegbarkeit beider Bedingungen an derselben
+        # Messlatte erhoben — genau das, was die Forschungsfrage zur Belegbarkeit
+        # verlangt ("ob die angeführte Information in dieser Quelle tatsächlich
+        # enthalten ist", einschließlich der Naive-Seite). Ohne diesen Durchgang
+        # bliebe die Naive-Bedingung allein über die FORM ihrer Quellenangabe
+        # beurteilt (siehe classify_explanation) — eine erfundene, aber konkret
+        # formulierte Quelle wäre von einer echten nicht zu unterscheiden.
+        #
+        # Faithfulness = Quellendeckung der Naive-Antwort (bewusst NICHT "Faithfulness"
+        # genannt: das Modell hat diesen Kontext nie gesehen, kann ihm also nicht
+        # "treu" sein — siehe SOURCE_SUPPORT_* und implementierung_schritte.md).
+        # ResponseRelevancy = Passung der Naive-Antwort zur Frage, symmetrisch zur
+        # RAG-Seite erhoben, damit der Vergleich auch die Antwortfokussierung erfasst
+        # (weicht die Antwort aus, bleibt sie unvollständig). ContextPrecision bleibt
+        # weg — es bewertet das Retrieval, das es in der Naive-Bedingung nicht gibt.
+        naive_dataset = EvaluationDataset(samples=[
+            SingleTurnSample(
+                user_input=s["question"],
+                retrieved_contexts=s["contexts"],
+                response=s["naive_answer"],
+            )
+            for s in evaluable
+        ])
+        naive_result = evaluate(
+            naive_dataset, metrics=[Faithfulness(), ResponseRelevancy()],
+            llm=judge, embeddings=embeddings,
+            run_config=run_config, raise_exceptions=False, show_progress=False,
+        )
+        for s, score in zip(evaluable, naive_result.scores):
+            s["_naive_ragas_score"] = score
+
     # 4) Ergebniszeilen — EINHEITLICH für alle Samples (RAGAS-Metriken bleiben None
     # außerhalb von 'evaluable', Vergleichsfelder sind für alle Samples befüllt).
     result_samples = []
     for s in samples:
         score = s.get("_ragas_score", {})
+        naive_score = s.get("_naive_ragas_score", {})
         result_samples.append({
             "date": s["date"], "ticker": s["ticker"], "question": s["question"],
             "status": s["status"], "n_contexts": len(s["contexts"]),
             "post_cutoff": s["post_cutoff"], "has_reference": s["reference"] is not None,
             "faithfulness": _clean(score.get("faithfulness")),
+            # Quellendeckung der Naive-Antwort gegen DIESELBE Quellenbasis
+            # (siehe Durchgang 3b). Eigener Name, weil die Naive-Bedingung den
+            # Kontext nie gesehen hat.
+            "source_support_naive": _clean(naive_score.get("faithfulness")),
             "answer_relevancy": _clean(score.get("answer_relevancy")),
+            "answer_relevancy_naive": _clean(naive_score.get("answer_relevancy")),
             "context_precision": _clean(score.get("llm_context_precision_without_reference")),
             "context_recall": _clean(score.get("context_recall")),
             "rag_answer": s["rag_answer"],
@@ -383,6 +487,9 @@ def run_ragas_evaluation(rag_pipeline, analysis_data, api_key):
         "answer_relevancy": _mean("answer_relevancy"),
         "context_precision": _mean("context_precision"),
         "context_recall": _mean("context_recall"),
+        # Naive-Bedingung an derselben Quellenbasis (siehe Durchgang 3b).
+        "source_support_naive": _mean("source_support_naive"),
+        "answer_relevancy_naive": _mean("answer_relevancy_naive"),
     }
 
     # Naive-LLM-vs-RAG-LLM-Vergleich (siehe About_Thesis.md Forschungsfrage-Teilfragen
@@ -416,16 +523,64 @@ def run_ragas_evaluation(rag_pipeline, analysis_data, api_key):
                 "post_cutoff": _category_pct("citation_rag", "named_source", cutoff_filter=True),
             },
         },
-        "rag_faithfulness_as_belegbarkeit": {
-            "all": aggregate["faithfulness"],
-            "pre_cutoff": _mean("faithfulness", cutoff_filter=False),
-            "post_cutoff": _mean("faithfulness", cutoff_filter=True),
+        # Antwortfokussierung (Response Relevancy) SYMMETRISCH je Bedingung: misst,
+        # ob die Antwort die Frage trifft oder ausweicht/unvollständig bleibt —
+        # keine Halluzinationsaussage (dafür source_support), sondern Antwortqualität.
+        "answer_relevancy": {
+            "rag": {
+                "all": aggregate["answer_relevancy"],
+                "pre_cutoff": _mean("answer_relevancy", cutoff_filter=False),
+                "post_cutoff": _mean("answer_relevancy", cutoff_filter=True),
+            },
+            "naive": {
+                "all": _mean("answer_relevancy_naive"),
+                "pre_cutoff": _mean("answer_relevancy_naive", cutoff_filter=False),
+                "post_cutoff": _mean("answer_relevancy_naive", cutoff_filter=True),
+            },
+        },
+        # Belegbarkeit SYMMETRISCH: beide Bedingungen an derselben Quellenbasis
+        # gemessen (siehe Durchgang 3b). Für die RAG-Bedingung ist das die bereits
+        # berechnete Faithfulness — nicht neu erhoben, sondern wiederverwendet.
+        "source_support": {
+            "rag": {
+                "all": aggregate["faithfulness"],
+                "pre_cutoff": _mean("faithfulness", cutoff_filter=False),
+                "post_cutoff": _mean("faithfulness", cutoff_filter=True),
+            },
+            "naive": {
+                "all": _mean("source_support_naive"),
+                "pre_cutoff": _mean("source_support_naive", cutoff_filter=False),
+                "post_cutoff": _mean("source_support_naive", cutoff_filter=True),
+            },
+        },
+        # Operationalisierung der in der Forschungsfrage genannten
+        # "Halluzinationsrate": Anteil der NICHT durch die Quellenbasis gedeckten
+        # Aussagen. Ausdrücklich KEINE Falschheitsaussage — eine Aussage kann
+        # zutreffen und trotzdem nicht in den abgerufenen Dokumenten stehen
+        # (siehe implementierung_schritte.md, Grenzen der Quellendeckung).
+        "unsupported_claim_rate": {
+            "rag": {
+                "all": _complement(aggregate["faithfulness"]),
+                "pre_cutoff": _complement(_mean("faithfulness", cutoff_filter=False)),
+                "post_cutoff": _complement(_mean("faithfulness", cutoff_filter=True)),
+            },
+            "naive": {
+                "all": _complement(_mean("source_support_naive")),
+                "pre_cutoff": _complement(_mean("source_support_naive", cutoff_filter=False)),
+                "post_cutoff": _complement(_mean("source_support_naive", cutoff_filter=True)),
+            },
         },
     }
 
     config = {
         "generator_model": GENERATOR_MODEL,
         "judge_model": JUDGE_MODEL,
+        # Anbieter mitschreiben: Modell und Parameter allein bestimmen die
+        # Vergleichbarkeit zwar vollstaendig, aber bei einem Anbieterwechsel muss
+        # nachvollziehbar bleiben, unter welcher Infrastruktur eine Messreihe
+        # entstanden ist (siehe callbacks/naive_llm.py::LLM_PROVIDER).
+        "llm_provider": LLM_PROVIDER,
+        "eval_max_workers": EVAL_MAX_WORKERS,
         "embedding_model": rag_pipeline.embedder.model_name,
         "top_k": TOP_K,
         "metrics": ["faithfulness", "answer_relevancy", "context_precision"]
@@ -434,6 +589,11 @@ def run_ragas_evaluation(rag_pipeline, analysis_data, api_key):
         "anomaly_prompt_safe_mode": ANOMALY_PROMPT_SAFE_MODE,
         "active_sources": [getattr(s, "name", "?") for s in rag_pipeline.sources],
         "generator_knowledge_cutoff": GENERATOR_KNOWLEDGE_CUTOFF,
+        # Sparmodus mitschreiben: ein Ergebnisobjekt aus einem Sparmodus-Lauf
+        # (kleine, ausgewogene Auswahl + Alpha Vantage aktiv) darf nicht mit den
+        # für die Thesis zählenden Zahlen aus dem Vollmodus verwechselt werden.
+        "saving_mode": bool(rag_config.SAVING_MODE),
+        "saving_mode_anomaly_keys": [f"{s['date']}|{s['ticker']}" for s in samples],
         "specificity_categories": list(SPECIFICITY_CATEGORIES),
         "citation_categories": list(CITATION_CATEGORIES),
         "citation_verification_limitation": (
@@ -442,14 +602,41 @@ def run_ragas_evaluation(rag_pipeline, analysis_data, api_key):
         ),
     }
 
+    # Gruppengroessen: Eine Quote ist nur zusammen mit ihrer Bezugsmenge deutbar —
+    # 100 % aus einer einzigen Anomalie und 100 % aus vierzig Anomalien sind im
+    # Ergebnisobjekt sonst nicht zu unterscheiden. Zusaetzlich zur Gesamtzahl wird
+    # je Gruppe die Zahl der AUSWERTBAREN Faelle gefuehrt (mit abgerufenem
+    # Kontext), denn nur diese gehen in die Quellendeckung ein.
+    def _group_size(cutoff_value):
+        rows = [r for r in result_samples if r["post_cutoff"] is cutoff_value]
+        return {
+            "total": len(rows),
+            "evaluable": sum(1 for r in rows if r["status"] == "ok"),
+        }
+
+    group_sizes = {
+        "pre_cutoff": _group_size(False),
+        "post_cutoff": _group_size(True),
+        # Anomalien mit unlesbarem Datum: weder der einen noch der anderen Gruppe
+        # zuzuordnen, daher separat ausgewiesen statt stillschweigend verteilt.
+        "unknown": _group_size(None),
+    }
+
     return {
         "samples": sorted(result_samples, key=lambda r: (r["date"] or "", r["ticker"] or "")),
         "aggregate": aggregate,
         "comparison": comparison,
+        "group_sizes": group_sizes,
         "config": config,
         "n_skipped": n_skipped,
         "timestamp": datetime.now().isoformat(),
     }
+
+
+def _complement(value):
+    """1 - value, mit None-Durchreichung. Wandelt einen Deckungsgrad in die
+    zugehörige Nicht-Deckungsquote um (siehe comparison.unsupported_claim_rate)."""
+    return None if value is None else 1.0 - float(value)
 
 
 def _clean(value):

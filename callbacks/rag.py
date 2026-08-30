@@ -1,40 +1,50 @@
 import os
 import logging
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 import pandas as pd
-from groq import Groq
 import dash_bootstrap_components as dbc
 from dash import Input, Output, State, html, no_update, ALL, ctx
 
 from rag.cache import NewsCache
 from rag.config import DEFAULT_CONFIG
+from rag import config as rag_config  # Sparmodus-Schalter, als Attribut gelesen
 
 # Identischer Prompt-Builder UND identisches Modell wie im Naive-Tab — ein einziger
 # Ort (GENERATOR_MODEL) verhindert ein stilles Auseinanderlaufen der beiden Modelle
 # (siehe Vorfall: Groq hat llama-3.3-70b-versatile zwischenzeitlich entfernt).
+# make_llm_client/llm_api_key kapseln zudem den austauschbaren LLM-Anbieter
+# (Groq/OpenRouter, siehe callbacks/naive_llm.py::LLM_PROVIDER).
 from callbacks.naive_llm import (build_portfolio_prompt, PROMPT_DEBUG_STYLE,
-                                 GENERATOR_MODEL, GENERATION_MAX_TOKENS)
+                                 GENERATOR_MODEL, GENERATION_MAX_TOKENS,
+                                 llm_chat_with_retry, select_prompt_anomalies,
+                                 single_stock_anomalies, prompt_anomaly_coverage_note,
+                                 effective_generation_max_tokens,
+                                 make_llm_client, llm_api_key, LLM_PROVIDER,
+                                 single_anomaly_data, _anomaly_llm_answer,
+                                 _anomaly_answer_heading)
+
+
+def _anomalies_to_index(analysis_data):
+    """Anomalien, für die Nachrichten geholt/indiziert werden. Im Sparmodus NUR die
+    im Prompt gelistete Auswahl — sonst würde der (kontingentierte) Alpha-Vantage-
+    Abruf über alle Anomalien laufen, obwohl das Retrieval später nur die Auswahl
+    anfragt. Im Vollmodus unverändert: alle Einzeltitel-Anomalien."""
+    if rag_config.SAVING_MODE:
+        return select_prompt_anomalies(analysis_data)
+    return single_stock_anomalies(analysis_data)
 
 logger = logging.getLogger(__name__)
 
 MODEL = GENERATOR_MODEL
-# Antwortbudget — aus callbacks/naive_llm.py übernommen, damit beide Bedingungen
-# zwangsläufig denselben Wert benutzen (ein zweiter Literalwert könnte auseinanderlaufen
-# und den Vergleich unbemerkt entwerten).
-MAX_TOKENS = GENERATION_MAX_TOKENS
+# Antwortbudget kommt über effective_generation_max_tokens() aus callbacks/naive_llm.py —
+# EIN Aufruf für beide Bedingungen, damit sie zwangsläufig denselben Wert benutzen (auch im
+# Testmodus, siehe dort) und ein zweiter Literalwert nicht unbemerkt auseinanderlaufen kann.
 
 # Serialisiert JEDEN Zugriff auf Vektorspeicher/Cache (FAISS ist nicht thread-sicher).
 # Auto-Fetch (Hintergrund) und manuelle Analyse dürfen den Store nicht gleichzeitig anfassen.
 _rag_lock = threading.Lock()
-
-
-def _single_stock_anomalies(analysis_data):
-    """Einzeltitel-Anomalien (concentration == 'Hisseye özgü' mit verantwortlichem Ticker)."""
-    return [
-        b for b in (analysis_data or {}).get('active_return_breaks', [])
-        if b.get('concentration') == 'Hisseye özgü' and b.get('responsible_ticker')
-    ]
 
 
 # Quellen ohne Tageskontingent — nur diese laufen im automatischen Hintergrund-Abruf.
@@ -50,7 +60,7 @@ def _index_anomaly_news(pipeline, analysis_data, only_sources=None):
     im Vektorindex (siehe RAGPipeline.index_news_for_tickers).
 
     `only_sources`: Beschränkt den Abruf auf bestimmte Quellen (siehe AUTO_FETCH_SOURCES)."""
-    for b in _single_stock_anomalies(analysis_data):
+    for b in _anomalies_to_index(analysis_data):
         ticker = b.get('responsible_ticker')
         date_str = b.get('date')
         if not (ticker and date_str):
@@ -90,62 +100,58 @@ def _background_index(rag_provider, analysis_data):
 NEWS_TABLE_HEADERS = ['#', 'Ticker', 'Datum', 'Titel', 'Quelle', 'Indexiert']
 
 
-# Kontextbudget für den GEPOOLTEN Prompt (alle Anomalien in einem Aufruf).
-# Bemessung: ein Chunk belegt im Kontextblock im Mittel ~830 Zeichen (gemessen am realen
-# Index), 25000 Token ≈ 100.000 Zeichen ≈ 120 Chunks — genug, damit auch bei ~100 Anomalien
-# jede mindestens einen Treffer beisteuert. Der Prompt bleibt damit bei ~26.000 Token, also
-# rund einem Fünftel des Kontextfensters.
-# NICHT zu verwechseln mit dem Budget in rag/evaluation.py: dort wird je Anomalie ein
-# eigener Aufruf gebaut, ein kleines Budget genügt dort.
-POOLED_CONTEXT_TOKEN_BUDGET = 25000
+# Kontextbudget je Anomalie-Aufruf. Anwendung und rag/evaluation.py bauen beide
+# einen eigenen Aufruf PRO Anomalie (kein pooled Prompt mehr) — derselbe Wert wie
+# dort (generate_answer: max_tokens=2000), damit Demonstration und Evaluation
+# denselben Kontextumfang sehen.
+PER_ANOMALY_CONTEXT_TOKEN_BUDGET = 2000
 RETRIEVAL_TOP_K = 3
+RETRIEVAL_QUERY = "reason for the stock price move, earnings, guidance or company news"
 
 
-def _collect_rag_context(rag_pipeline, analysis_data):
-    """Ruft Nachrichten-Kontext ab — NUR für Einzeltitel-Anomalien (Ticker + Zeitfenster).
+def _retrieve_for_selected(rag_pipeline, analysis_data):
+    """Retrieval je im Prompt gelisteter Einzeltitel-Anomalie.
 
-    Kein Fallback und KEINE allgemeinen Nachrichten. Gibt es für eine Anomalie im Fenster
-    keine passende Nachricht, bleibt der Kontext insoweit leer.
-
-    Reihum-Verteilung (Round Robin): Die Chunks werden NICHT anomalieweise aneinandergehängt,
-    sondern rangweise — erst der beste Treffer jeder Anomalie, dann der zweitbeste, dann der
-    dritte. Grund: Der Kontextblock wird am Budget abgeschnitten. Bei anomalieweiser Reihung
-    verbrauchen die ersten Anomalien ihre drei Treffer, bevor spätere überhaupt einen
-    bekommen — diese fielen dann vollständig aus dem Kontext und die RAG-Bedingung wäre für
-    sie stillschweigend identisch mit der Naive-Bedingung. Reihum verliert stattdessen jede
-    Anomalie zuerst ihren *drittbesten* Treffer; die Abdeckung bleibt gleichmäßig.
-
-    Rückgabe: (kontext, chunks_im_kontext, anzahl_verworfen).
+    Rückgabe: Liste von (anomalie, chunks) — chunks ist die für genau diese
+    Anomalie (Ticker + Zeitfenster) abgerufene Trefferliste, ohne Fallback. Die
+    Deduplizierung über Anomalien hinweg entfällt bewusst: jeder Aufruf ist
+    eigenständig, ein Chunk darf für zwei verschiedene Ereignisse relevant sein.
     """
-    per_anomaly = [
-        rag_pipeline.retrieve_for_anomaly(
-            "reason for the stock price move, earnings, guidance or company news",
-            b, top_k=RETRIEVAL_TOP_K)
-        for b in _single_stock_anomalies(analysis_data)
+    return [
+        (b, rag_pipeline.retrieve_for_anomaly(RETRIEVAL_QUERY, b, top_k=RETRIEVAL_TOP_K))
+        for b in select_prompt_anomalies(analysis_data)
     ]
 
-    retrieved, seen = [], set()
-    for rank in range(RETRIEVAL_TOP_K):
-        for chunks in per_anomaly:
-            if rank >= len(chunks):
-                continue
-            c = chunks[rank]
-            link = c.get('metadata', {}).get('link', '')
-            key = link or c.get('text', '')[:80]
-            if key not in seen:
-                seen.add(key)
-                retrieved.append(c)
 
-    context, used = rag_pipeline.format_context_for_llm(
-        retrieved, max_tokens=POOLED_CONTEXT_TOKEN_BUDGET, return_used=True)
-    return context, used, len(retrieved) - len(used)
+def _source_card(i, chunk):
+    md = chunk.get('metadata', {})
+    not_dated = md.get('date_filtered') is False
+    return dbc.Card([dbc.CardBody([
+        dbc.Row([
+            dbc.Col([html.H6(f"[{i}] {md.get('ticker', 'N/A')} - {md.get('title', 'N/A')[:60]}",
+                             style={'color': '#58a6ff'})], width=9),
+            dbc.Col([
+                html.Small(md.get('source', 'Unknown'), className="text-muted d-block"),
+                html.Small(md.get('published', '')[:10], className="text-muted")
+            ], width=3)
+        ]),
+        html.P(chunk.get('text', '')[:200] + "...",
+               className="text-muted small", style={'marginTop': '10px', 'marginBottom': '10px'}),
+        html.Div([
+            html.A("📌 Link zur Nachricht", href=md.get('link', '#'), target="_blank",
+                   className="small", style={'color': '#79c0ff', 'textDecoration': 'underline'}),
+            html.Span(" · Kontext nicht aus dem Anomaliefenster (Fallback)",
+                      className="small text-warning") if not_dated else None,
+        ])
+    ])], className="card-custom", style={'marginBottom': '10px'})
 
 
 def _run_rag_analysis(rag_pipeline, analysis_data):
-    """Führt die RAG-Analyse aus und baut Ergebniskarte + Quellenliste.
+    """RAG-Analyse: je Einzeltitel-Anomalie ein eigener Retrieval + LLM-Aufuf (kein
+    pooled Prompt mehr) — dieselbe Ein-Ereignis-Mechanik wie rag/evaluation.py, damit
+    Demonstration und Evaluation über denselben Pfad laufen.
 
-    Gemeinsame Logik für den RAG-Tab UND den Vergleichs-Tab (ein Trigger-Button löst
-    dort beide Analysen aus) — identischer Code, ein einziger Ort zum Pflegen.
+    Gemeinsame Logik für den RAG-Tab UND den Vergleichs-Tab.
     """
     if not rag_pipeline:
         return dbc.Alert("RAG Pipeline nicht verfügbar oder nicht initialisiert", color="warning")
@@ -153,69 +159,57 @@ def _run_rag_analysis(rag_pipeline, analysis_data):
         return dbc.Alert("Keine Portfolio-Daten verfügbar. Bitte füge zuerst Positionen hinzu.", color="warning")
 
     try:
-        # 1+2) NUR anomalie-bezogene Nachrichten indizieren und abrufen — unter dem
-        # Store-Lock (kein paralleler Zugriff mit dem Auto-Fetch-Thread).
+        # Indizieren + Retrieval unter dem Store-Lock (kein paralleler FAISS-Zugriff
+        # mit dem Auto-Fetch-Thread). Die LLM-Aufrufe danach brauchen den Lock nicht.
         with _rag_lock:
             _index_anomaly_news(rag_pipeline, analysis_data)
-            context, retrieved, dropped = _collect_rag_context(rag_pipeline, analysis_data)
+            per_anomaly = _retrieve_for_selected(rag_pipeline, analysis_data)
 
-        # 3) IDENTISCHER Prompt wie im Naive-Tab, plus abgerufener Nachrichten-Kontext.
-        prompt = build_portfolio_prompt(analysis_data, news_context=context or None)
+        if not per_anomaly:
+            return dbc.Alert("Keine Einzeltitel-Anomalien zu erklären.", color="info")
 
-        client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
-        response = client.chat.completions.create(
-            messages=[{"role": "user", "content": prompt}],
-            model=MODEL,
-            max_tokens=MAX_TOKENS,
-        )
-        llm_response = response.choices[0].message.content
+        # Kontext je Anomalie formatieren; die LLM-Aufrufe laufen nebenläufig.
+        prepared = []
+        for b, chunks in per_anomaly:
+            ctx, used = rag_pipeline.format_context_for_llm(
+                chunks, max_tokens=PER_ANOMALY_CONTEXT_TOKEN_BUDGET, return_used=True)
+            prepared.append((b, ctx, used))
 
-        # Antwort
-        components = [
-            dbc.Card([dbc.CardBody([
-                html.H5("RAG-gestützte Analyse", className="mb-3", style={'color': '#f0f6fc'}),
-                html.Div(llm_response, style={
-                    'whiteSpace': 'pre-wrap', 'lineHeight': '1.6', 'fontSize': '0.95rem',
-                    'color': '#f0f6fc'
-                }),
-                html.Hr(),
+        results = [None] * len(prepared)
+
+        def _task(idx, b, ctx):
+            try:
+                results[idx] = _anomaly_llm_answer(analysis_data, b, news_context=ctx or None)
+            except Exception as e:
+                results[idx] = f"[Fehler: {e}]"
+
+        with ThreadPoolExecutor(max_workers=min(len(prepared), 8)) as pool:
+            for fut in [pool.submit(_task, i, b, ctx) for i, (b, ctx, _u) in enumerate(prepared)]:
+                fut.result()
+
+        components = [html.H5("RAG-gestützte Analyse — Erklärung je Anomalie",
+                              className="mb-3", style={'color': '#f0f6fc'})]
+        all_used = []
+        for (b, _ctx, used), text in zip(prepared, results):
+            all_used.extend(used)
+            components.append(dbc.Card([dbc.CardBody([
+                html.H6(_anomaly_answer_heading(b), className="mb-2", style={'color': '#58a6ff'}),
+                html.Div(text, style={'whiteSpace': 'pre-wrap', 'lineHeight': '1.6',
+                                      'fontSize': '0.95rem', 'color': '#f0f6fc'}),
                 html.Small(
-                    f"Erstellt mit Groq ({MODEL}) · Gleicher Prompt wie Naive-LLM, zusätzlich "
-                    f"{len(retrieved)} abgerufene Nachrichten-Snippets als Kontext."
-                    # Budget-Kürzung sichtbar machen: sonst würde eine Antwort mit
-                    # unvollständigem Kontext wie eine mit vollständigem aussehen.
-                    + (f" · {dropped} weitere(s) Snippet(s) wegen Kontextbudget nicht "
-                       f"übergeben." if dropped else ""),
-                    className="text-muted"
-                )
-            ])], className="card-custom mt-3")
-        ]
+                    f"{len(used)} abgerufene Nachrichten-Snippet(s) als Kontext"
+                    if used else "(no sources retrieved for this event)",
+                    className="text-muted"),
+            ])], className="card-custom", style={'marginBottom': '10px'}))
 
-        # Quellen (Top-K)
-        if retrieved:
+        components.append(html.Small(
+            f"Erstellt mit {LLM_PROVIDER} ({MODEL}) · je Anomalie ein eigener Aufruf"
+            + prompt_anomaly_coverage_note(analysis_data), className="text-muted"))
+
+        if all_used:
             components.append(html.H5("📰 Verwendete Quellen", style={
                 'color': '#79c0ff', 'marginTop': '20px', 'marginBottom': '10px'}))
-            for i, chunk in enumerate(retrieved, 1):
-                md = chunk.get('metadata', {})
-                not_dated = md.get('date_filtered') is False
-                components.append(dbc.Card([dbc.CardBody([
-                    dbc.Row([
-                        dbc.Col([html.H6(f"[{i}] {md.get('ticker', 'N/A')} - {md.get('title', 'N/A')[:60]}",
-                                         style={'color': '#58a6ff'})], width=9),
-                        dbc.Col([
-                            html.Small(md.get('source', 'Unknown'), className="text-muted d-block"),
-                            html.Small(md.get('published', '')[:10], className="text-muted")
-                        ], width=3)
-                    ]),
-                    html.P(chunk.get('text', '')[:200] + "...",
-                           className="text-muted small", style={'marginTop': '10px', 'marginBottom': '10px'}),
-                    html.Div([
-                        html.A("📌 Link zur Nachricht", href=md.get('link', '#'), target="_blank",
-                               className="small", style={'color': '#79c0ff', 'textDecoration': 'underline'}),
-                        html.Span(" · Kontext nicht aus dem Anomaliefenster (Fallback)",
-                                  className="small text-warning") if not_dated else None,
-                    ])
-                ])], className="card-custom", style={'marginBottom': '10px'}))
+            components.extend(_source_card(i, c) for i, c in enumerate(all_used, 1))
 
         return html.Div(components)
 
@@ -230,33 +224,39 @@ def _run_rag_analysis(rag_pipeline, analysis_data):
 
 
 def _rag_prompt_component(rag_provider, analysis_data):
-    """Baut die Debug-Anzeige des exakten RAG-Prompts (inkl. abgerufenem Nachrichten-
-    Kontext). Gemeinsame Logik für den 'Prompt anzeigen'-Button im RAG-Tab UND im
-    Vergleichs-Tab.
+    """Debug-Anzeige der RAG-Prompts (inkl. abgerufenem Kontext) — je Anomalie ein
+    Prompt, mit Trenner dazwischen. Gemeinsame Logik für RAG-Tab UND Vergleichs-Tab.
     """
     if not analysis_data or not analysis_data.get('positions'):
         return dbc.Alert("Keine Portfolio-Daten verfügbar.", color="warning")
 
     rag_pipeline = rag_provider.get()
     if not rag_pipeline:
-        prompt = build_portfolio_prompt(analysis_data)
         return html.Pre(
-            prompt + "\n\n[RAG nicht verfügbar — Nachrichten-Kontext fehlt]",
+            build_portfolio_prompt(analysis_data) + "\n\n[RAG nicht verfügbar — Nachrichten-Kontext fehlt]",
             style=PROMPT_DEBUG_STYLE)
 
     with _rag_lock:
         _index_anomaly_news(rag_pipeline, analysis_data)
-        context, _, _ = _collect_rag_context(rag_pipeline, analysis_data)
+        per_anomaly = _retrieve_for_selected(rag_pipeline, analysis_data)
 
-    prompt = build_portfolio_prompt(analysis_data, news_context=context or None)
-    return html.Pre(prompt, style=PROMPT_DEBUG_STYLE)
+    if not per_anomaly:
+        return html.Pre(build_portfolio_prompt(analysis_data), style=PROMPT_DEBUG_STYLE)
+
+    parts = []
+    for b, chunks in per_anomaly:
+        ctx = rag_pipeline.format_context_for_llm(chunks, max_tokens=PER_ANOMALY_CONTEXT_TOKEN_BUDGET)
+        parts.append(build_portfolio_prompt(single_anomaly_data(analysis_data, b),
+                                            news_context=ctx or None))
+    return html.Pre(("\n\n" + "=" * 70 + "\n\n").join(parts), style=PROMPT_DEBUG_STYLE)
 
 
 EVAL_METRIC_LABELS = {
-    "faithfulness": "Faithfulness (Quellentreue)",
+    "faithfulness": "Faithfulness (Quellentreue, RAG)",
     "answer_relevancy": "Answer Relevancy",
     "context_precision": "Context Precision",
     "context_recall": "Context Recall (Ground Truth)",
+    "source_support_naive": "Quellendeckung (Naive, gegen dieselbe Quellenbasis)",
 }
 
 
@@ -268,14 +268,34 @@ def _fmt_pct(v):
     return "—" if v is None else f"{v:.1f}%"
 
 
+def _group_size_note(group_sizes):
+    """Bezugsmengen der Cutoff-Gruppen als Fliesstext. `total` ist die Zahl der
+    Anomalien in der Gruppe, `evaluable` die Teilmenge mit abgerufenem Kontext —
+    nur diese geht in die Quellendeckung ein."""
+    if not group_sizes:
+        return ""
+    pre, post = group_sizes.get("pre_cutoff", {}), group_sizes.get("post_cutoff", {})
+    unknown = group_sizes.get("unknown", {})
+    text = (f"Bezugsmengen — vor Cutoff: n={pre.get('total', 0)} "
+            f"(auswertbar {pre.get('evaluable', 0)}), "
+            f"nach Cutoff: n={post.get('total', 0)} "
+            f"(auswertbar {post.get('evaluable', 0)})")
+    if unknown.get("total"):
+        text += f", ohne Datumszuordnung: n={unknown['total']}"
+    return text + ". "
+
+
 def _comparison_table(comparison):
     """Naive-LLM-vs-RAG-LLM-Vergleich (Spezifität, Zitierbarkeit) — siehe
     About_Thesis.md Forschungsfrage-Teilfragen 1-4 und rag/evaluation.py::comparison.
     Kein direktes RAGAS-Metrik-Objekt; separate Hakem-Klassifikation, siehe dort.
     """
-    spec, cite, faith = (
-        comparison["specificity_pct"], comparison["named_citation_pct"],
-        comparison["rag_faithfulness_as_belegbarkeit"],
+    spec, cite = comparison["specificity_pct"], comparison["named_citation_pct"]
+    # Belegbarkeit wird für BEIDE Bedingungen an derselben Quellenbasis erhoben
+    # (siehe rag/evaluation.py, Durchgang 3b); die Nicht-Deckungsquote ist die
+    # Operationalisierung der in der Forschungsfrage genannten Halluzinationsrate.
+    support, unsupported = (
+        comparison["source_support"], comparison["unsupported_claim_rate"],
     )
     rows = [
         {
@@ -303,11 +323,22 @@ def _comparison_table(comparison):
             "RAG — Nach Cutoff": _fmt_pct(cite["rag"]["post_cutoff"]),
         },
         {
-            "Metrik": "Faithfulness (Belegbarkeit-Proxy, nur RAG möglich)",
-            "Naive — Alle": "—", "Naive — Vor Cutoff": "—", "Naive — Nach Cutoff": "—",
-            "RAG — Alle": _fmt_metric(faith["all"]),
-            "RAG — Vor Cutoff": _fmt_metric(faith["pre_cutoff"]),
-            "RAG — Nach Cutoff": _fmt_metric(faith["post_cutoff"]),
+            "Metrik": "Quellendeckung (Anteil belegter Aussagen)",
+            "Naive — Alle": _fmt_metric(support["naive"]["all"]),
+            "Naive — Vor Cutoff": _fmt_metric(support["naive"]["pre_cutoff"]),
+            "Naive — Nach Cutoff": _fmt_metric(support["naive"]["post_cutoff"]),
+            "RAG — Alle": _fmt_metric(support["rag"]["all"]),
+            "RAG — Vor Cutoff": _fmt_metric(support["rag"]["pre_cutoff"]),
+            "RAG — Nach Cutoff": _fmt_metric(support["rag"]["post_cutoff"]),
+        },
+        {
+            "Metrik": "  ↳ Nicht belegte Aussagen (Halluzinationsrate)",
+            "Naive — Alle": _fmt_metric(unsupported["naive"]["all"]),
+            "Naive — Vor Cutoff": _fmt_metric(unsupported["naive"]["pre_cutoff"]),
+            "Naive — Nach Cutoff": _fmt_metric(unsupported["naive"]["post_cutoff"]),
+            "RAG — Alle": _fmt_metric(unsupported["rag"]["all"]),
+            "RAG — Vor Cutoff": _fmt_metric(unsupported["rag"]["pre_cutoff"]),
+            "RAG — Nach Cutoff": _fmt_metric(unsupported["rag"]["post_cutoff"]),
         },
     ]
     return dbc.Table.from_dataframe(
@@ -322,11 +353,11 @@ def _run_ragas_eval(rag_provider, analysis_data):
     data/ground_truth.json (siehe rag/evaluation.py). Läuft unter demselben Lock wie
     die reguläre RAG-Analyse (kein paralleler FAISS-Zugriff).
     """
-    if not os.environ.get("GROQ_API_KEY"):
-        return dbc.Alert("GROQ_API_KEY nicht gesetzt.", color="warning")
+    if not llm_api_key():
+        return dbc.Alert("LLM-API-Schlüssel nicht gesetzt (siehe LLM_PROVIDER).", color="warning")
     if not analysis_data or not analysis_data.get('positions'):
         return dbc.Alert("Keine Portfolio-Daten verfügbar. Bitte füge zuerst Positionen hinzu.", color="warning")
-    if not _single_stock_anomalies(analysis_data):
+    if not single_stock_anomalies(analysis_data):
         return dbc.Alert("Keine Einzeltitel-Anomalien — nichts zu bewerten.", color="info")
 
     rag_pipeline = rag_provider.get()
@@ -341,7 +372,7 @@ def _run_ragas_eval(rag_provider, analysis_data):
     try:
         with _rag_lock:
             _index_anomaly_news(rag_pipeline, analysis_data)
-            result = run_ragas_evaluation(rag_pipeline, analysis_data, os.environ.get("GROQ_API_KEY"))
+            result = run_ragas_evaluation(rag_pipeline, analysis_data, llm_api_key())
         path = save_eval_results(result)
 
         rows = []
@@ -383,7 +414,14 @@ def _run_ragas_eval(rag_provider, analysis_data):
                 "Self-Preference-Bias als Limitation zu beachten). ",
                 "Zitierbarkeit prüft nur die Formulierung (benannte vs. vage Quelle), "
                 "NICHT die reale Existenz der Quelle (keine Websuche). ",
+                "Quellendeckung misst beide Bedingungen an derselben abgerufenen "
+                "Quellenbasis; die Naive-Bedingung hat diesen Kontext nie gesehen. "
+                "Nicht belegt heißt nicht falsch — eine Aussage kann zutreffen und "
+                "trotzdem nicht in den abgerufenen Dokumenten stehen. ",
                 f"{result['n_skipped']} Anomalie(n) ohne abgerufenen Kontext (RAG). ",
+                # Bezugsmengen der Cutoff-Gruppen: ohne sie ist eine Quote nicht
+                # deutbar (siehe rag/evaluation.py::group_sizes).
+                _group_size_note(result.get("group_sizes")),
                 f"Ergebnis gespeichert unter {path}.",
             ], className="text-muted"),
         ])
@@ -411,7 +449,8 @@ def _anomaly_source_modal_body(ticker, date_str):
         return dbc.Alert("Ungültiges Datum.", color="warning")
 
     cache = NewsCache(DEFAULT_CONFIG.db_path)
-    articles = cache.get_articles(ticker, day, DEFAULT_CONFIG.anomaly_window_days)
+    articles = cache.get_articles(ticker, day, DEFAULT_CONFIG.anomaly_window_days,
+                                  window_days_after=DEFAULT_CONFIG.anomaly_window_days_after)
     if not articles:
         return dbc.Alert("Keine Quellen im Cache für dieses Fenster.", color="info")
 
@@ -448,7 +487,7 @@ def register(app, rag_provider):
         App-Start, Tickern, Anomalien — lazy geladen wird). Der Cache verhindert
         wiederholtes Laden bei erneuten Auslösungen.
         """
-        if not analysis_data or not _single_stock_anomalies(analysis_data):
+        if not analysis_data or not single_stock_anomalies(analysis_data):
             return no_update  # keine Einzeltitel-Anomalie → nichts abzurufen
 
         threading.Thread(
