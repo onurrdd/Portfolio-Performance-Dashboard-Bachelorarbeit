@@ -65,7 +65,7 @@ except Exception as e:
 
 if not isinstance(GENERATOR_MODEL, str) or not GENERATOR_MODEL:
     fail("GENERATOR_MODEL ist kein nichtleerer String")
-if LLM_PROVIDER not in ("groq", "openrouter"):
+if LLM_PROVIDER != "openrouter":
     fail("Unbekannter LLM_PROVIDER: " + str(LLM_PROVIDER))
 if not isinstance(llm_base_url(), str) or "://" not in llm_base_url():
     fail("llm_base_url() liefert keine URL")

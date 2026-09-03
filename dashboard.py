@@ -279,6 +279,18 @@ app.layout = html.Div([
                                 )
                             ])
                         ]),
+                        dbc.Row([
+                            dbc.Col([
+                                dbc.Button("Ohne Sparmodus einbezogene Anomalien anzeigen (Debug)",
+                                          id="btn-toggle-naive-fullscope", color="secondary",
+                                          className="btn-custom mb-3"),
+                                dbc.Collapse(
+                                    html.Div(id="naive-fullscope-container"),
+                                    id="collapse-naive-fullscope",
+                                    is_open=False,
+                                )
+                            ])
+                        ]),
                     ])
                 ]),
 
@@ -310,6 +322,12 @@ app.layout = html.Div([
                         ]),
                         dbc.Row([
                             dbc.Col([
+                                dbc.Button("Index neu aufbauen (Cache, kein Netzabruf)",
+                                          id="btn-rag-reindex",
+                                          color="secondary", outline=True,
+                                          className="btn-custom mb-3 me-2"),
+                                html.Span(id="rag-reindex-status", className="me-2"),
+                                html.Br(),
                                 dbc.Button("Prompt anzeigen (vorübergehend/Debug)", id="btn-toggle-rag-prompt",
                                           color="secondary", className="btn-custom mb-3"),
                                 dbc.Collapse(
@@ -321,8 +339,10 @@ app.layout = html.Div([
                         ]),
                         dbc.Row([
                             dbc.Col([
-                                dbc.Button("RAG-Qualität bewerten (RAGAS)", id="btn-rag-evaluate",
-                                          color="secondary", className="btn-custom mb-3"),
+                                dbc.Button("RAG-Qualität bewerten (RAGAS) — deaktiviert",
+                                          id="btn-rag-evaluate",
+                                          color="danger", outline=True, disabled=True,
+                                          className="btn-custom mb-3"),
                                 dcc.Loading(id="loading-rag-eval", type="default",
                                           children=html.Div(id="rag-eval-output"))
                             ])

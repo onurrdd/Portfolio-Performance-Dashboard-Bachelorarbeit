@@ -56,8 +56,7 @@ logger = logging.getLogger(__name__)
 # Judge = Generator (bewusst identisch) — siehe Docstring oben.
 JUDGE_MODEL = GENERATOR_MODEL
 # Anbieter-Endpunkt/-Schlüssel kommen zentral aus callbacks/naive_llm.py
-# (LLM_PROVIDER) — Groq und OpenRouter bedienen denselben Modellnamen über
-# dieselbe OpenAI-kompatible Schnittstelle.
+# (OpenRouter, OpenAI-kompatible Schnittstelle).
 #
 # GENERATOR_KNOWLEDGE_CUTOFF ist eine Eigenschaft des Generator-Modells und wohnt
 # daher in callbacks/naive_llm.py; hier nur importiert (Vor/Nach-Cutoff-Etikett).
@@ -383,12 +382,15 @@ def run_ragas_evaluation(rag_pipeline, analysis_data, api_key):
         # einen OpenAI-kompatiblen Endpunkt) lehnt n>1 ab ("'n' : number must be
         # at most 1"); ResponseRelevancy würde sonst mit n=strictness aufrufen und
         # scheitern — bypass_n erzwingt stattdessen einzelne Aufrufe.
-        # timeout: Ein einzelner Judge-Aufruf umfasst bei einem Reasoning-Modell
-        # zuerst einen unsichtbaren Denkschritt und erst danach die strukturierte
-        # Ausgabe; ueber einen vermittelnden Anbieter kommt die Routing-Latenz
-        # hinzu. Bei 120 s brachen einzelne Aufrufe reproduzierbar ab und lieferten
-        # NaN statt eines Messwerts — der Wert ist deshalb grosszuegig gesetzt.
-        run_config = RunConfig(timeout=300, max_retries=8, max_wait=60,
+        # timeout/max_retries/max_wait: mit reasoning_effort="low" beendet ein
+        # einzelner Judge-Aufruf ueber OpenRouter (bezahltes Kontingent, kein
+        # Minutenlimit) i. d. R. in unter einer Minute. Die frueher grosszuegigen
+        # Werte (timeout=300, max_retries=8, max_wait=60) stammten aus einer Phase
+        # mit strengem Minutenlimit und zogen einen einzelnen fehlerhaften Fall
+        # minutenlang in die Laenge. Schlaegt ein Aufruf trotz der drei Versuche
+        # fehl, liefert raise_exceptions=False fuer diese Metrik NaN, ohne den Lauf
+        # abzubrechen.
+        run_config = RunConfig(timeout=120, max_retries=3, max_wait=20,
                                max_workers=EVAL_MAX_WORKERS)
         judge = LangchainLLMWrapper(raw_llm, run_config=run_config, bypass_n=True)
 

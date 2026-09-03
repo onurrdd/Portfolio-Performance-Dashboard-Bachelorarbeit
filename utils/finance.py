@@ -55,6 +55,14 @@ def _price_db():
                 "(ticker TEXT, date TEXT, close REAL, PRIMARY KEY (ticker, date))")
     con.execute("CREATE TABLE IF NOT EXISTS coverage "
                 "(ticker TEXT PRIMARY KEY, min_date TEXT, max_date TEXT)")
+    # split_scale = Tag des letzten Splits, der beim Befüllen des Cache bereits
+    # eingepreist war. yfinance liefert split-bereinigte Closes bezogen auf den
+    # Abrufzeitpunkt; ein Split NACH dem Abruf entwertet die gespeicherten Kurse.
+    # Ohne diese Spalte lägen Vor- und Nach-Split-Kurse desselben Tickers in einer
+    # Spalte auf zwei Skalen und erzeugten einen Scheinsprung um den Split-Faktor.
+    cols = [r[1] for r in con.execute("PRAGMA table_info(coverage)")]
+    if "split_scale" not in cols:
+        con.execute("ALTER TABLE coverage ADD COLUMN split_scale TEXT")
     # Split-Historie persistent (wie prices): Splits vergangener Tage sind
     # unveränderlich. `fetched` = Tag des letzten Netzabrufs; ein leeres Ergebnis
     # (Ticker ohne Splits) wird als eine Zeile mit ratio IS NULL vermerkt, damit
@@ -90,16 +98,29 @@ def get_price_history_cached(ticker, start, end):
     end = pd.to_datetime(end).normalize()
     yesterday = pd.Timestamp.now().normalize() - timedelta(days=1)
 
+    last_split = _last_split_date(ticker)
+    split_tag = last_split.strftime('%Y-%m-%d') if last_split is not None else ''
+
     con = _price_db()
     try:
-        row = con.execute("SELECT min_date, max_date FROM coverage WHERE ticker=?",
+        row = con.execute("SELECT min_date, max_date, split_scale FROM coverage WHERE ticker=?",
                           (ticker,)).fetchone()
+        # Kurse, die vor dem jüngsten Split geholt wurden, stehen auf der alten
+        # Skala. Sie mit später geholten Kursen zu mischen ergäbe einen Sprung um
+        # den Split-Faktor, den die Renditerechnung als Tagesrendite läse — der
+        # Ticker wird deshalb einmalig komplett neu geladen.
+        if row is not None and (row[2] or '') != split_tag:
+            con.execute("DELETE FROM prices WHERE ticker=?", (ticker,))
+            con.execute("DELETE FROM coverage WHERE ticker=?", (ticker,))
+            row = None
+
         if row is None:
             _fetch_and_store(con, ticker, start, end)
             persist_max = min(end, yesterday)
             if persist_max >= start:
-                con.execute("INSERT OR REPLACE INTO coverage VALUES (?,?,?)",
-                            (ticker, start.strftime('%Y-%m-%d'), persist_max.strftime('%Y-%m-%d')))
+                con.execute("INSERT OR REPLACE INTO coverage VALUES (?,?,?,?)",
+                            (ticker, start.strftime('%Y-%m-%d'), persist_max.strftime('%Y-%m-%d'),
+                             split_tag))
         else:
             cov_min, cov_max = pd.to_datetime(row[0]), pd.to_datetime(row[1])
             if start < cov_min:
@@ -109,8 +130,9 @@ def get_price_history_cached(ticker, start, end):
             new_min = min(start, cov_min)
             new_max = max(cov_max, min(end, yesterday))
             if new_min != cov_min or new_max != cov_max:
-                con.execute("INSERT OR REPLACE INTO coverage VALUES (?,?,?)",
-                            (ticker, new_min.strftime('%Y-%m-%d'), new_max.strftime('%Y-%m-%d')))
+                con.execute("INSERT OR REPLACE INTO coverage VALUES (?,?,?,?)",
+                            (ticker, new_min.strftime('%Y-%m-%d'), new_max.strftime('%Y-%m-%d'),
+                             split_tag))
         con.commit()
         df = pd.read_sql(
             "SELECT date, close FROM prices WHERE ticker=? AND date BETWEEN ? AND ? ORDER BY date",
@@ -191,13 +213,34 @@ def _get_splits(ticker):
     return _cached(f"splits:{ticker}", _fetch)
 
 
+def _last_split_date(ticker):
+    """Datum des jüngsten Splits, oder None. Kennzeichnet die Skala, auf der die
+    gecachten Closes eines Tickers stehen (siehe get_price_history_cached)."""
+    try:
+        splits = _get_splits(ticker)
+    except Exception:
+        return None
+    if splits is None or splits.empty:
+        return None
+    last = pd.Timestamp(splits.index.max())
+    # yfinance liefert tz-aware, der SQLite-Cache tz-naive Stempel.
+    return last.tz_localize(None) if last.tz is not None else last
+
+
 def fetch_price_at_date(ticker, date):
     def _fetch():
         try:
             stock = yf.Ticker(ticker)
             start = pd.to_datetime(date) - timedelta(days=5)
             end = pd.to_datetime(date) + timedelta(days=5)
-            hist = stock.history(start=start, end=end, auto_adjust=False)
+            # auto_adjust=True (Standard): split-bereinigte Closes, dieselbe Skala
+            # wie calculate_portfolio_timeseries (Zeile ~287) und die dort ebenfalls
+            # split-bereinigten shares. Mit False läge buy_price auf der rohen,
+            # vorsplit Skala, während shares bereits bereinigt ist — der Mischmaßstab
+            # ließ z. B. bei GME (4:1-Split) den investierten Betrag um den
+            # Split-Faktor zu klein erscheinen und die synthetische Benchmark-Position
+            # entsprechend verzerrt (build_synthetic_benchmark_positions).
+            hist = stock.history(start=start, end=end)
             if not hist.empty:
                 return hist['Close'].iloc[0]
             return None
@@ -251,6 +294,14 @@ def build_synthetic_benchmark_positions(positions, benchmark_prices, benchmark_t
         if pd.isna(price_at_buy):
             continue
 
+        # HIER bewusst die rohe Stückzahl (anders als Zeile ~294 und
+        # callbacks/charts.py): invested_amount bildet ab, was am Kauftag TATSÄCHLICH
+        # gezahlt wurde. buy_price ist bereits der reale Kurs jenes Tages (bei
+        # auto_load aus der CSV, sonst über fetch_price_at_date/auto_adjust=True
+        # geholt) — auf DIESELBE Stückzahl bezogen, mit der investiert wurde, also
+        # die rohe. Eine split-bereinigte Stückzahl mit dem realen Kurs des Kauftags
+        # zu multiplizieren würde den investierten Betrag künstlich um den
+        # Split-Faktor vergrößern (z. B. GME 4:1: 1200 statt 300 Stück × Kaufkurs).
         invested_amount = pos['shares'] * pos['buy_price']
         benchmark_positions.append({
             'ticker': benchmark_ticker,

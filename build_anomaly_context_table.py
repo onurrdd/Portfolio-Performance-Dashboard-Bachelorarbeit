@@ -1,11 +1,11 @@
 """
-Baut einen Groq-freien Snapshot des Retrieval-Ergebnisses für JEDE Einzeltitel-Anomalie
+Baut einen LLM-freien Snapshot des Retrieval-Ergebnisses für JEDE Einzeltitel-Anomalie
 des aktuellen Portfolios: (Datum, Ticker, gecachte Quellen im Fenster, tatsaechlich an
 den Prompt gehender Kontext-Block).
 
 Zweck: Die Forschungsfrage "Erklaert die abgerufene Quelle die Kursbewegung ueberhaupt?"
 laesst sich allein am Retrieval beurteilen, ohne einen LLM-Aufruf. Retrieval ist lokal
-und kostenlos (FAISS + MiniLM + SQLite + SEC EDGAR); Groq-Kontingent wird NICHT
+und kostenlos (FAISS + MiniLM + SQLite + SEC EDGAR); kein LLM-Kontingent wird
 angefasst. Der Sparmodus (rag_config.SAVING_MODE) wird hier zur Laufzeit
 abgeschaltet — es laufen ALLE Einzeltitel-Anomalien des Portfolios durch, nicht nur
 die im UI-Prompt gelistete Auswahl, und Alpha Vantage bleibt damit gesperrt.

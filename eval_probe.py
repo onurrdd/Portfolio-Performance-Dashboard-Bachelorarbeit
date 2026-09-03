@@ -1,5 +1,5 @@
-"""Vollstaendiger Evaluationslauf (RAGAS + Naive-vs-RAG-Vergleich) auf einer
-KLEINEN, fest gewaehlten Stichprobe von drei Anomalien.
+"""Vollstaendiger Evaluationslauf (RAGAS + Naive-vs-RAG-Vergleich) auf der
+KLEINEN, fest gewaehlten Anomalie-Stichprobe aus rag/config.py.
 
 Zweck: Pruefen, ob die Evaluationsarchitektur (rag/evaluation.py) end-to-end
 traegt — Kontextabruf, Antworterzeugung in beiden Bedingungen, Hakem-
@@ -7,17 +7,16 @@ Klassifikation, RAGAS-Metriken, Aggregation und Persistenz — ohne das
 Tageskontingent des LLM-Anbieters mit allen Anomalien des Portfolios zu
 verbrauchen. Ein vollstaendiger Lauf ueber alle Einzeltitel-Anomalien wuerde je
 Anomalie rund ein Dutzend LLM-Aufrufe ausloesen; diese Stichprobe kostet einen
-Bruchteil davon und deckt trotzdem beide Quellentypen ab.
+Bruchteil davon.
 
-Die drei Faelle sind bewusst gewaehlt (identisch zu probe.py):
-  - 2024-01-25 TSLA: Kontext ausschliesslich aus einem Quartalsbericht (SEC)
-  - 2021-01-27 GME:  Kontext ausschliesslich aus Nachrichtenartikeln
-  - 2024-04-24 TSLA: gemischter Kontext (Nachrichten + SEC)
+Die bearbeiteten Faelle stehen in rag/config.py (PROBE_POOL/PROBE_PICK) — EINE
+Quelle fuer Dashboard-Sparmodus, probe.py und diesen Lauf. Die volle Auswahl
+[1,2,3,4] deckt beide Seiten des Wissensschnitts und beide Quellentypen ab.
 
 rag_config.SAVING_MODE wird fuer diesen Lauf zur Laufzeit abgeschaltet (die Datei
-bleibt unveraendert): der Sparmodus waehlt sonst selbst eine Auswahl und wuerde
-die hier gesetzte Stichprobe (PROBE_KEYS) ueberschreiben. Alpha Vantage bleibt
-damit ebenfalls gesperrt — die Stichprobe zieht ihren Kontext aus dem Cache.
+bleibt unveraendert): der Sparmodus waehlt sonst selbst und wuerde die hier
+gesetzte Stichprobe (PROBE_KEYS) ueberschreiben. Alpha Vantage bleibt damit
+ebenfalls gesperrt — die Stichprobe zieht ihren Kontext aus dem Cache.
 
 Nutzung: python eval_probe.py
 """
@@ -42,25 +41,10 @@ from rag.pipeline import RAGPipeline
 from rag.evaluation import run_ragas_evaluation, save_eval_results
 from callbacks.naive_llm import llm_api_key, LLM_PROVIDER
 
-# (Datum, Ticker) der Stichprobe: ein 2x2-Zuschnitt ueber die beiden Dimensionen,
-# die die Auswertung trennen muss — Wissensschnitt (vor/nach
-# GENERATOR_KNOWLEDGE_CUTOFF) und Quellentyp (Pressemitteilung/Bericht aus dem
-# Archiv vs. redaktioneller Nachrichtenartikel).
-#
-# Der Wissensschnitt ist der Grund fuer diesen Zuschnitt: Teilfrage 3 und 4 der
-# Forschungsfrage vergleichen das Verhalten VOR und NACH dem Trainingszeitraum.
-# Eine Stichprobe, die vollstaendig auf einer Seite des Schnitts liegt, laesst
-# beide Fragen unbeantwortet — die entsprechende Gruppe bleibt leer und alle
-# Kennzahlen dieser Gruppe sind undefiniert.
-#
-# Alle vier Faelle haben nachweislich Quellen im Anomaliefenster, liefern also
-# status="ok" und gehen in die Quellendeckung ein.
-PROBE_KEYS = {
-    ("2024-01-25", "TSLA"),   # vor  Cutoff · Quartalsbericht (Archiv)
-    ("2021-01-27", "GME"),    # vor  Cutoff · Nachrichtenartikel
-    ("2025-06-05", "TSLA"),   # NACH Cutoff · Nachrichtenartikel
-    ("2026-07-23", "TSLA"),   # NACH Cutoff · Quartalsbericht (Archiv)
-}
+# Die bearbeitete Stichprobe kommt aus rag/config.py (PROBE_POOL/PROBE_PICK) —
+# EINE Quelle für Dashboard-Sparmodus, probe.py und diesen Lauf. Auswahl ändern:
+# dort PROBE_PICK anpassen, nicht hier.
+PROBE_KEYS = {rag_config.PROBE_POOL[i - 1] for i in rag_config.PROBE_PICK}
 
 
 def _build_analysis_data():

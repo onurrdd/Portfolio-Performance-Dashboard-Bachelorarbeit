@@ -5,9 +5,6 @@ Die Quellen sind über die Registry news.base.get_sources() austauschbar: eine n
 Quelle (API/Feed/Scraper) implementiert news.base.NewsSource und wird dort eingetragen;
 die Pipeline bleibt unverändert.
 
-Metadaten-Filterung (Exposé 3.4): Retrieval kann nach Ticker und/oder Zeitfenster
-eingeschränkt werden. Da FAISS keine native where-Filterung besitzt, wird ein größerer
-Kandidaten-Pool geholt und anschließend in Python gefiltert (siehe RAGConfig.filter_pool_size).
 """
 from typing import List, Dict, Optional, Set
 import logging
@@ -21,6 +18,25 @@ from rag.embeddings import EmbeddingGenerator
 from rag.vectorstore import FAISSVectorStore
 
 logger = logging.getLogger(__name__)
+
+
+def _saving_mode_windows(config: RAGConfig) -> List[tuple]:
+    from rag import config as rag_config
+    if not getattr(rag_config, "SAVING_MODE", False):
+        return []
+    windows = []
+    for key in rag_config.SAVING_MODE_PINNED:
+        if "|" not in key:
+            continue
+        date_str, ticker = key.split("|", 1)
+        try:
+            day = datetime.fromisoformat(date_str)
+        except ValueError:
+            continue
+        start = day - timedelta(days=config.anomaly_window_days)
+        end = day + timedelta(days=config.anomaly_window_days_after + 1)
+        windows.append((ticker, int(start.timestamp()), int(end.timestamp())))
+    return windows
 
 
 class RAGPipeline:
@@ -154,6 +170,46 @@ class RAGPipeline:
         logger.info(f"Indexing complete: {stats}")
         return stats
 
+    def reindex_from_cache(self) -> Dict:
+        """Baut den Vektorindex aus dem Cache neu auf — ohne Netzabruf.
+
+        Nötig, sobald sich das Chunking (rag/chunker.py) ändert: index_news_for_tickers
+        segmentiert ausschließlich NEUE Artikel, bereits gecachte bleiben mit ihren
+        alten Chunks im Index. Ohne Neuaufbau misst man stillschweigend den alten Stand.
+
+        Der Cache bleibt unangetastet; er ist die kanonische Quelle, der Index nur ein
+        daraus abgeleiteter Suchindex. Ändert sich dagegen die Textextraktion
+        (news/sec_edgar.py), reicht das nicht — dann steht bereits im Cache der alte
+        Rohtext und rebuild_index.py muss die Artikel neu abrufen.
+        """
+        articles = self.cache.all_articles_full()
+        # Im Sparmodus nur die Artikel einbetten, die in ein untersuchtes
+        # Anomaliefenster fallen. Der Index deckt dann bewusst NICHT mehr das ganze
+        # Portfolio ab — für einen vollen Lauf muss er einmal ohne Sparmodus neu
+        # gebaut werden (die Schaltfläche nennt den jeweiligen Umfang).
+        windows = _saving_mode_windows(self.config)
+        if windows:
+            articles = [
+                a for a in articles
+                if any(a.get("ticker") == t and lo <= (a.get("published_epoch") or 0) <= hi
+                       for t, lo, hi in windows)
+            ]
+        before = self.vectorstore.count_documents()
+        self.vectorstore.reset()
+        chunks = self.chunker.process_articles(articles) if articles else []
+        if chunks:
+            chunks = self.embedder.embed_chunks(chunks)
+            self.vectorstore.add_chunks(chunks)
+        stats = {
+            "articles": len(articles),
+            "chunks_before": before,
+            "chunks_after": self.vectorstore.count_documents(),
+            # None = volles Portfolio; sonst die Titel der untersuchten Fenster.
+            "scope": sorted({t for t, _, _ in windows}) if windows else None,
+        }
+        logger.info(f"Reindex from cache complete: {stats}")
+        return stats
+
     def retrieve_context(self, query: str, top_k: Optional[int] = None,
                          filter_ticker: Optional[str] = None,
                          date_from: Optional[datetime] = None,
@@ -239,17 +295,7 @@ class RAGPipeline:
 
     def retrieve_for_anomaly(self, query: str, anomaly: Dict,
                              top_k: Optional[int] = None) -> List[Dict]:
-        """Retrieval, das gezielt auf ein Anomalie-Ereignis abgestimmt ist.
 
-        Filtert strikt nach dem verantwortlichen Ticker UND einem ASYMMETRISCHEN
-        Zeitfenster um das Anomaliedatum: config.anomaly_window_days rückwärts, aber
-        nur config.anomaly_window_days_after vorwärts. Ein Dokument, das der
-        Kursbewegung vorausgeht oder ihr um höchstens einen Tag folgt, kann sie erklärt
-        haben; ein Dokument, das erst deutlich später erscheint, kann nur eine Folge
-        beschreiben, nicht die Ursache (Look-Ahead-Bias) — siehe RAGConfig. KEIN
-        Fallback: gibt es im Fenster keine passende Nachricht, wird eine leere Liste
-        zurückgegeben (kein Rückgriff auf aktuelle, themenfremde Nachrichten).
-        """
         top_k = top_k or self.config.top_k
         ticker = anomaly.get("responsible_ticker") or None
         date_from = date_to = None

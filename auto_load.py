@@ -1,10 +1,10 @@
 """
-Temporary auto-load: imports portfolio_5_ticker.csv on app startup.
+Temporary auto-load: imports portfolio_10_ticker_backup.csv on app startup.
 """
 import os
 import pandas as pd
 
-CSV_PATH = os.path.join(os.path.dirname(__file__), "portfolio_5_ticker_older.csv")
+CSV_PATH = os.path.join(os.path.dirname(__file__), "portfolio_10_ticker_backup.csv")
 
 
 def load_initial_positions(fetch_price_fn):

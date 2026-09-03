@@ -36,7 +36,8 @@ CREATE TABLE IF NOT EXISTS articles (
     published_epoch INTEGER,
     source          TEXT,
     indexed         INTEGER DEFAULT 0,
-    fetched_at      TEXT
+    fetched_at      TEXT,
+    relevance_score REAL
 );
 CREATE INDEX IF NOT EXISTS idx_ticker_epoch ON articles(ticker, published_epoch);
 """
@@ -49,6 +50,12 @@ class NewsCache:
         self.db_path = db_path
         with self._connect() as con:
             con.executescript(_SCHEMA)
+            # CREATE TABLE IF NOT EXISTS legt eine neue Spalte in einer bereits
+            # bestehenden Datenbank nicht an — ohne diese Migration bliebe
+            # relevance_score in jedem Cache aus einer früheren Sitzung unlesbar.
+            cols = {r[1] for r in con.execute("PRAGMA table_info(articles)")}
+            if "relevance_score" not in cols:
+                con.execute("ALTER TABLE articles ADD COLUMN relevance_score REAL")
         logger.info(f"NewsCache bereit ({db_path}, {self.count()} Artikel)")
 
     @contextmanager
@@ -125,10 +132,12 @@ class NewsCache:
                 epoch = published_to_epoch(a.get("published", ""))
                 cur = con.execute(
                     "INSERT OR IGNORE INTO articles"
-                    "(link, ticker, title, summary, published, published_epoch, source, indexed, fetched_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?)",
+                    "(link, ticker, title, summary, published, published_epoch, source, "
+                    "indexed, fetched_at, relevance_score) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?)",
                     (link, a.get("ticker", ""), a.get("title", ""), a.get("summary", ""),
-                     a.get("published", ""), epoch, a.get("source", ""), now),
+                     a.get("published", ""), epoch, a.get("source", ""), now,
+                     a.get("relevance_score")),
                 )
                 if cur.rowcount == 1:
                     new_articles.append(a)
@@ -161,7 +170,8 @@ class NewsCache:
         Tabelle nur Anzeigespalten liefert. Grundlage für einen Neuaufbau des
         Vektorindex aus dem Cache heraus (siehe rebuild_index.py): der Cache bleibt
         die kanonische Quelle, FAISS/metadata.pkl ist ein daraus abgeleiteter Index."""
-        cols = "link, ticker, title, summary, published, published_epoch, source, indexed"
+        cols = ("link, ticker, title, summary, published, published_epoch, source, "
+                "indexed, relevance_score")
         with self._connect() as con:
             rows = con.execute(f"SELECT {cols} FROM articles").fetchall()
         keys = cols.replace(" ", "").split(",")

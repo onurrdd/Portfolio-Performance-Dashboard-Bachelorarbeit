@@ -5,12 +5,8 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from typing import Optional
 import pandas as pd
-from groq import Groq, RateLimitError as GroqRateLimitError
-try:
-    from openai import RateLimitError as OpenAIRateLimitError, APITimeoutError as OpenAIAPITimeoutError
-except ImportError:
-    OpenAIRateLimitError = GroqRateLimitError  # Platzhalter, falls openai-Paket fehlt
-    OpenAIAPITimeoutError = GroqRateLimitError
+from openai import (OpenAI, RateLimitError as OpenAIRateLimitError,
+                   APITimeoutError as OpenAIAPITimeoutError)
 import dash_bootstrap_components as dbc
 from dash import Input, Output, State, html, no_update
 
@@ -23,60 +19,46 @@ from rag.config import DEFAULT_CONFIG
 # Attribut gelesen werden, damit die Umsetzung greift (siehe rag/config.py).
 from rag import config as rag_config
 
-# --- LLM-Anbieter (austauschbar) ---
-# Groq und OpenRouter bedienen denselben offenen Modellnamen (openai/gpt-oss-120b)
-# über dieselbe OpenAI-kompatible REST-Schnittstelle; nur Endpunkt und Schlüssel
-# unterscheiden sich. Die Umschaltung erfolgt zentral über eine Umgebungsvariable,
-# damit kein Aufrufer (Naive-LLM, RAG-LLM, Evaluation) angepasst werden muss, wenn
-# das Kontingent eines Anbieters erschöpft ist — betrifft NICHT die AI-Risk-Analyse
-# (callbacks/ai_analysis.py), die unverändert an Groq gebunden bleibt.
-LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "groq").lower()
-_PROVIDER_BASE_URLS = {
-    "groq": "https://api.groq.com/openai/v1",
-    "openrouter": "https://openrouter.ai/api/v1",
-}
-_PROVIDER_API_KEY_ENV = {
-    "groq": "GROQ_API_KEY",
-    "openrouter": "OPENROUTER_API_KEY",
-}
+# --- LLM-Anbieter ---
+# Naive-LLM, RAG-LLM und die RAGAS-Evaluation laufen über OpenRouter (openai/gpt-oss-120b
+# über die OpenAI-kompatible REST-Schnittstelle). Betrifft NICHT die AI-Risk-Analyse
+# (callbacks/ai_analysis.py), die eine eigene, unabhängige Anbindung hat.
+LLM_PROVIDER = "openrouter"
+_OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 
 
 def llm_base_url() -> str:
-    return _PROVIDER_BASE_URLS[LLM_PROVIDER]
+    return _OPENROUTER_BASE_URL
 
 
 def llm_api_key() -> str:
-    return os.environ.get(_PROVIDER_API_KEY_ENV[LLM_PROVIDER], "")
+    return os.environ.get("OPENROUTER_API_KEY", "")
 
 
-# Hartes Request-Timeout (Sekunden) für jeden LLM-Aufruf. Ein Reasoning-Modell
-# braucht für die volle Antwort mitunter mehrere Minuten; darüber hinaus deutet
-# Stillstand auf eine hängende Verbindung hin und der Aufruf soll mit Fehler
-# abbrechen, statt einen Lauf unbegrenzt zu blockieren.
-_REQUEST_TIMEOUT = 300.0
+# Hartes Request-Timeout (Sekunden) für jeden LLM-Aufruf. openai/gpt-oss-120b
+# liefert mit reasoning_effort="low" i. d. R. in unter einer Minute; darüber
+# hinaus deutet Stillstand auf eine hängende Verbindung hin und der Aufruf soll
+# mit Fehler abbrechen, statt einen Lauf unbegrenzt zu blockieren.
+_REQUEST_TIMEOUT = 120.0
 
 
 def make_llm_client():
-    """Liefert einen Chat-Completions-Client für den aktiven Anbieter (LLM_PROVIDER).
+    """Liefert einen Chat-Completions-Client für OpenRouter.
 
     Mit hartem Request-Timeout: OpenRouter kann eine Antwort beliebig lange
     verzögern; ohne Timeout blockiert der Aufruf unbegrenzt und ein
     Evaluationslauf hängt statt mit einem Fehler abzubrechen (den
     llm_chat_with_retry als Nicht-429 durchreicht)."""
-    if LLM_PROVIDER == "groq":
-        return Groq(api_key=llm_api_key(), timeout=_REQUEST_TIMEOUT)
-    from openai import OpenAI
     return OpenAI(base_url=llm_base_url(), api_key=llm_api_key(), timeout=_REQUEST_TIMEOUT)
 
 # Sprache der LLM-ANTWORT: "de", "en" oder "tr".
 # Die Prompts selbst sind IMMER Englisch (Projektregel, siehe CLAUDE.md).
-RESPONSE_LANGUAGE = "tr"
+RESPONSE_LANGUAGE = "en"
 
 # Generierungsmodell für Naive-LLM UND RAG-LLM (identisch, siehe callbacks/rag.py::MODEL).
-# Ursprünglich llama-3.3-70b-versatile; von Groq zwischenzeitlich aus dem Angebot
-# entfernt (API liefert 404 "model does not exist"). Ersatz: openai/gpt-oss-120b
-# (ein Reasoning-Modell — benötigt ausreichend max_tokens, da vor der Antwort ein
-# interner Denkschritt Tokens verbraucht; 4096 hat sich als ausreichend erwiesen).
+# openai/gpt-oss-120b ist ein Reasoning-Modell — es benötigt ausreichend max_tokens, da
+# vor der Antwort ein interner Denkschritt Tokens verbraucht; 4096 hat sich als
+# ausreichend erwiesen.
 GENERATOR_MODEL = "openai/gpt-oss-120b"
 
 # Wissensstand des Generator-Modells (openai/gpt-oss-120b), laut offizieller Model
@@ -89,10 +71,8 @@ GENERATOR_KNOWLEDGE_CUTOFF = "2024-06-01"
 
 # Antwortbudget für BEIDE Bedingungen (Naive-LLM und RAG-LLM). Modell UND Parameter
 # müssen über beide Bedingungen identisch sein — sonst wäre ein beobachteter
-# Unterschied nicht mehr allein dem Retrieval zuzuschreiben. Der Wert ist durch das
-# Minuten-Token-Limit des Anbieters (Groq Free-Tier, 8000 TPM: prompt_tokens +
-# max_tokens zusammen) nach oben begrenzt; eine unabgeschnittene Antwort wird daher
-# über die Anzahl der im Prompt gelisteten Ereignisse gesteuert
+# Unterschied nicht mehr allein dem Retrieval zuzuschreiben. Eine unabgeschnittene
+# Antwort wird über die Anzahl der im Prompt gelisteten Ereignisse gesteuert
 # (PROMPT_ANOMALY_CAP_PER_TICKER), nicht über ein großes Budget.
 # effective_generation_max_tokens() (unten) ist der tatsächlich verwendete Wert — dort
 # fließt auch der Sparmodus (rag_config.SAVING_MODE) ein; callbacks/rag.py ruft dieselbe
@@ -128,25 +108,27 @@ diversification, or general market conditions).
 
 """
 
-PART2_TEMPLATE = """=== PART 2: SINGLE-STOCK ANOMALY EVENTS ===
+PART2_TEMPLATE = """You are a financial analyst explaining a single unusual price movement.
 
-Below is a list of single-stock anomaly events detected in this portfolio. Each event is a case where a specific stock showed an unusually large price move on a specific date — large both relative to its own historical volatility and relative to how the market moved that day.
-
-ANOMALY EVENTS:
+[ANOMALY]
 {anomaly_list}
 
-For each event listed above, explain the reason for this price move on that
-specific date.
-Address every event individually; do not summarize them collectively.
+[TASK]
+Explain what caused this price move on this exact date.
 
-For each explanation, also state what you are basing it on (e.g. a specific news report,
-earnings release, or your own general knowledge of the event) — name the source if you are
-citing one.
+[RULES]
+Answer in exactly two numbered sections, with no introduction and no closing remarks:
 
+1. Specific Event: Name the concrete event behind the move (for example an earnings
+report, a guidance change, a product announcement, an analyst rating action, regulatory
+or legal news, or an acquisition). Avoid generic explanations such as market volatility,
+investor sentiment or macroeconomic conditions unless no company-level event applies.
+2. Source: Name the source that documents this event.
+
+Explain only the cause. Do not give portfolio advice, risk management or diversification
+recommendations, and do not comment on the portfolio's composition.
 """
-# (or the previous trading day, since news can affect prices with a one-day lag)
-# Give a specific, concrete, and definitive answer for each event. Do NOT give generic or
-# vague explanations. Commit to a direct answer.
+
 if INCLUDE_METRICS_PART:
     PROMPT_TEMPLATE = (
         'Analyze the portfolio below and give me professional feedback.\n'
@@ -154,10 +136,18 @@ if INCLUDE_METRICS_PART:
         + PART1_TEMPLATE + PART2_TEMPLATE
     )
 else:
-    PROMPT_TEMPLATE = (
-        'Analyze the portfolio below and give me professional feedback.\n\n'
-        + PART2_TEMPLATE
-    )
+    # Ohne den Kennzahlenteil bleibt allein die Ursachenfrage übrig. Die frühere
+    # Aufforderung zu "professional feedback" stammt aus dem Metrikteil und hat
+    # das Modell dazu gebracht, an jede Erklärung Depotempfehlungen anzuhängen
+    # (Stop-Loss, Diversifikation, Sektorgewichtung). Dieser Teil steht in keiner
+    # abgerufenen Quelle, senkt die Quellentreue, verwässert die Antwortfokussierung
+    # und ließ die Antwort so lang werden, dass der Bewerter sie nicht mehr
+    # vollständig prüfen konnte.
+    #
+    # Kein einleitender Rahmensatz mehr: Anwendung und Evaluation rufen je Anomalie
+    # einzeln auf, ein Prompt beschreibt also genau EIN Ereignis. Formulierungen im
+    # Plural ("a list of unusual price movements") beschrieben den Prompt falsch.
+    PROMPT_TEMPLATE = PART2_TEMPLATE
 
 # "en" fehlt bewusst: der Prompt ist bereits Englisch, eine Extra-Anweisung wäre redundant.
 RESPONSE_LANGUAGE_INSTRUCTIONS = {
@@ -171,7 +161,7 @@ ANOMALY_PROMPT_SAFE_MODE = False
 
 # Kleineres Antwortbudget für den Sparmodus (rag_config.SAVING_MODE): dort stehen nur
 # wenige Ereignisse im Prompt, entsprechend weniger Antworttext ist nötig, und ein
-# einzelner Aufruf reserviert so wenig wie möglich vom Tages-Token-Kontingent (TPD).
+# einzelner Aufruf verbraucht so wenig Token wie möglich.
 # Nur das LLM-Budget wohnt hier; der Modus-Schalter selbst steht in rag/config.py.
 SAVING_MODE_MAX_TOKENS = 1536
 
@@ -207,9 +197,9 @@ TABLE_TEXT = {
 
 # Obergrenze der im gepoolten Prompt gelisteten Ereignisse, je verantwortlichem Titel.
 # Der Prompt verlangt eine eigene Erklärung je Ereignis, die benötigte Antwortlänge wächst
-# also linear mit der Ereigniszahl, während das Antwortbudget durch das Minutenlimit des
-# Anbieters hart begrenzt ist. Die Auswahl je Titel (statt global) verhindert, dass eine
-# dominante Position die Liste monopolisiert. Auswahlkriterium ist die standardisierte
+# also linear mit der Ereigniszahl, während das Antwortbudget begrenzt ist. Die Auswahl
+# je Titel (statt global) verhindert, dass eine dominante Position die Liste
+# monopolisiert. Auswahlkriterium ist die standardisierte
 # Abweichung |surprise_mad_z| — dasselbe Maß, das die Anomalie überhaupt auslöst.
 # Gilt NUR für den gepoolten Prompt der Anwendung; die Evaluation (rag/evaluation.py)
 # baut je Anomalie einen eigenen Aufruf und wertet daher ALLE Anomalien aus.
@@ -293,7 +283,8 @@ def select_saving_mode_anomalies(single_stock):
     return sorted(selected, key=lambda b: str(b['date']))
 
 
-def select_prompt_anomalies(analysis_data, cap_per_ticker=PROMPT_ANOMALY_CAP_PER_TICKER):
+def select_prompt_anomalies(analysis_data, cap_per_ticker=PROMPT_ANOMALY_CAP_PER_TICKER,
+                            ignore_saving_mode=False):
     """Auswahl der zu erklärenden Einzeltitel-Anomalien: je verantwortlichem Titel die
     `cap_per_ticker` stärksten nach |surprise_mad_z|, Rückgabe chronologisch sortiert.
 
@@ -302,9 +293,11 @@ def select_prompt_anomalies(analysis_data, cap_per_ticker=PROMPT_ANOMALY_CAP_PER
 
     Im Sparmodus (rag_config.SAVING_MODE) wird die normale Kappung übersprungen und
     stattdessen select_saving_mode_anomalies genutzt — siehe dort.
+    `ignore_saving_mode=True` überspringt diesen Zweig und liefert die Auswahl, die
+    OHNE Sparmodus gälte (nur für die Debug-Vorschau, nie für einen LLM-Aufruf).
     """
     single_stock = single_stock_anomalies(analysis_data)
-    if rag_config.SAVING_MODE:
+    if rag_config.SAVING_MODE and not ignore_saving_mode:
         return select_saving_mode_anomalies(single_stock)
     if cap_per_ticker is None:
         return single_stock
@@ -345,27 +338,43 @@ def prompt_anomaly_coverage_note(analysis_data):
 
 
 def _build_anomaly_list_text(analysis_data):
-    """Baut die Anomalie-Liste (Teil 2 des Prompts) aus den einzeltitelbezogenen Ereignissen."""
+    """Baut den Ereignisblock des Prompts aus den einzeltitelbezogenen Anomalien.
+
+    Der Regelfall ist EIN Ereignis (Anwendung und Evaluation rufen je Anomalie
+    einzeln auf); dann entsteht ein Feldblock aus Ticker, Datum und Bewegung, den
+    das Modell ohne Fließtext ablesen kann. Enthält die Auswahl ausnahmsweise
+    mehrere Ereignisse, werden die Blöcke nummeriert aneinandergehängt — dasselbe
+    Feldformat, nur wiederholt.
+    """
     selected = select_prompt_anomalies(analysis_data)
     if not selected:
         return NO_ANOMALY_PLACEHOLDER
-    lines = []
-    for b in selected:
+
+    def _block(b, prefix=""):
         own_return = b.get('ticker_own_return_pct', 0) or 0
         direction = "rose" if own_return >= 0 else "fell"
-        lines.append(
-            f"- {b['date']}: {b['responsible_ticker']} {direction} {own_return:+.2f}%"
-        )
-    return chr(10).join(lines)
+        return (f"{prefix}Stock (Ticker): {b['responsible_ticker']}\n"
+                f"{prefix}Date: {b['date']}\n"
+                f"{prefix}Price movement: {direction} {own_return:+.2f}%")
+
+    if len(selected) == 1:
+        return _block(selected[0])
+    return ("\n\n").join(
+        f"Event {i}:\n{_block(b)}" for i, b in enumerate(selected, 1))
 
 
 def build_portfolio_prompt(analysis_data, news_context=None):
-    """Baut den Portfolio-Analyse-Prompt.
+    """Baut den Prompt zur Erklärung einer Anomalie.
 
     Wird von BEIDEN LLM-Tabs genutzt, damit der Prompt identisch ist. Der einzige
     Unterschied zwischen Naive-LLM und RAG-LLM ist der optionale `news_context`, der
     beim RAG-Tab als abgerufener Nachrichten-Kontext angehängt wird — so lässt sich der
     Effekt des Retrievals isoliert beobachten.
+
+    Die Antwort ist auf zwei nummerierte Abschnitte festgelegt (Ereignis, Quelle).
+    Das entspricht den beiden Größen, die der Hakem ohnehin klassifiziert
+    (rag/evaluation.py::classify_explanation: specificity und citation_type), und
+    macht sie im Antworttext getrennt adressierbar statt in Fließtext verstreut.
     """
     metrics = (analysis_data or {}).get('metrics', {})
     rolling_sharpe = (analysis_data or {}).get('rolling_sharpe', {})
@@ -381,14 +390,21 @@ def build_portfolio_prompt(analysis_data, news_context=None):
         anomaly_list=_build_anomaly_list_text(analysis_data),
     )
     if news_context:
+        # Einziger Unterschied zwischen den Bedingungen (siehe Docstring). Der Block
+        # steht hinter den Regeln, damit er die zwei geforderten Abschnitte nicht
+        # verdrängt, und bindet beide an den Kontext: Abschnitt 1 darf nur ein
+        # Ereignis nennen, das im Kontext steht, Abschnitt 2 nur eine dort genannte
+        # Quelle. Der ausdrückliche Ausweg ("no specific cause found") ist nötig,
+        # damit ein schwaches Retrieval nicht in eine erfundene Erklärung mündet.
         prompt += (
-            "\n\n=== RETRIEVED NEWS CONTEXT (RAG) ===\n"
-            "The news items below are grouped by event, each under its own "
-            "'--- Event: ... ---' heading. Use a group's items ONLY to explain that "
-            "group's event. If a group says no sources were retrieved, or its items are "
-            "not genuinely relevant, say so explicitly instead of forcing a connection "
-            "or borrowing another event's sources.\n"
-            f"{news_context}"
+            "\n[RETRIEVED CONTEXT]\n"
+            f"{news_context}\n"
+            "\nBase your answer on the retrieved context above. In section 1, name only "
+            "an event that the context actually reports; if it contains no specific "
+            "cause for this move, write \"No specific cause found in the retrieved "
+            "context\" instead of drawing on general knowledge. In section 2, cite only "
+            "a source that appears in the context; do not name a source that is not "
+            "there.\n"
         )
     if ANOMALY_PROMPT_SAFE_MODE:
         prompt += PROMPT_ANOMALY_SAFETY_INSTRUCTION
@@ -406,17 +422,17 @@ PROMPT_DEBUG_STYLE = {
 }
 
 
-# Wartezeit-Hinweis in der Fehlermeldung des Anbieters — Groq gibt je nach Limit-Typ
-# unterschiedliche Formate zurück: "try again in 12.5s" (Minutenlimit, TPM) oder
-# "try again in 26m18.96s" (Tageslimit, TPD). Alle drei Einheiten sind optional, damit
-# beide Formate (und ein möglicher "1h2m3s"-Fall) mit derselben Regex erfasst werden.
+# Wartezeit-Hinweis in einer 429-Fehlermeldung — das Feld erscheint in Formen wie
+# "try again in 12.5s" oder "try again in 26m18.96s". Alle drei Einheiten sind optional,
+# damit die unterschiedlichen Formate (auch ein möglicher "1h2m3s"-Fall) mit derselben
+# Regex erfasst werden.
 _RETRY_AFTER_RE = re.compile(
     r"try again in (?:(?P<h>\d+)h)?(?:(?P<m>\d+)m)?(?:(?P<s>[\d.]+)s)?", re.IGNORECASE)
 _RETRY_MAX_ATTEMPTS = 3
-_RETRY_FALLBACK_WAIT = 45.0
-# Über dieser Wartezeit lohnt sich kein Retry mehr INNERHALB desselben UI-Klicks — das
-# deutet auf ein Tages- statt ein Minutenlimit hin (TPD statt TPM). Retrying würde den
-# Klick minutenlang blockieren und am Ende doch fehlschlagen; der Fehler wird stattdessen
+_RETRY_FALLBACK_WAIT = 15.0
+# Über dieser Wartezeit lohnt sich kein Retry mehr INNERHALB desselben UI-Klicks —
+# eine so lange Sperre ändert sich im Sekundenbereich nicht. Retrying würde den Klick
+# minutenlang blockieren und am Ende doch fehlschlagen; der Fehler wird stattdessen
 # sofort weitergereicht (siehe _run_naive_analysis/_run_rag_analysis: dort wird er als
 # Alert angezeigt, nicht verschluckt).
 _RETRY_MAX_WAIT = 90.0
@@ -431,18 +447,18 @@ def _parse_retry_after(message: str) -> Optional[float]:
 
 
 def llm_chat_with_retry(client, **kwargs):
-    """LLM-Aufruf mit Wiederholung ausschließlich bei KURZEN Minutenlimit-Fehlern (429).
+    """LLM-Aufruf mit Wiederholung ausschließlich bei KURZEN Rate-Limit-Fehlern (429).
 
     Der Vergleichs-Tab löst Naive- und RAG-Analyse im selben Moment aus; beide Aufrufe
-    fallen damit in dasselbe Minutenfenster des Anbieters und der zweite läuft ohne
+    treffen denselben Endpunkt kurz hintereinander und der zweite läuft ohne
     Wiederholung in einen Rate-Limit-Fehler. Andere Fehler (u. a. 413, oder ein 429 mit
-    langer Wartezeit — Tageslimit) werden NICHT wiederholt — ein erneuter Aufruf würde
+    langer Wartezeit) werden NICHT wiederholt — ein erneuter Aufruf würde
     nur Zeit verbrauchen, ohne das Ergebnis zu ändern.
     """
     for attempt in range(_RETRY_MAX_ATTEMPTS):
         try:
             return client.chat.completions.create(**kwargs)
-        except (GroqRateLimitError, OpenAIRateLimitError) as e:
+        except OpenAIRateLimitError as e:
             wait = _parse_retry_after(str(e))
             if wait is None:
                 wait = _RETRY_FALLBACK_WAIT
@@ -455,7 +471,7 @@ def llm_chat_with_retry(client, **kwargs):
             # beim letzten Versuch durchreichen, damit der Lauf nicht ewig läuft.
             if attempt == _RETRY_MAX_ATTEMPTS - 1:
                 raise
-            time.sleep(5)
+            time.sleep(3)
 
 
 def effective_generation_max_tokens():
@@ -565,6 +581,29 @@ def _naive_prompt_component(analysis_data):
         return html.Pre(build_portfolio_prompt(analysis_data), style=PROMPT_DEBUG_STYLE)
     parts = [build_portfolio_prompt(single_anomaly_data(analysis_data, b)) for b in anomalies]
     return html.Pre(("\n\n" + "=" * 70 + "\n\n").join(parts), style=PROMPT_DEBUG_STYLE)
+
+
+def _naive_fullscope_component(analysis_data):
+    """Debug-Vorschau: welche Einzeltitel-Anomalien der Naive-LLM-Tab bearbeiten würde,
+    wenn der Sparmodus (rag_config.SAVING_MODE) AUS wäre — Ticker, Datum, Titel-Rendite.
+    Reine Anzeige aus analysis_data, kein Netzabruf, kein LLM-Aufruf; die Sparmodus-
+    Auswahl selbst bleibt unberührt."""
+    if not analysis_data or not analysis_data.get('positions'):
+        return dbc.Alert("Keine Portfolio-Daten verfügbar.", color="warning")
+    full = select_prompt_anomalies(analysis_data, ignore_saving_mode=True)
+    if not full:
+        return dbc.Alert("Keine Einzeltitel-Anomalien im Portfolio.", color="info")
+    active = {_anomaly_key(b) for b in select_prompt_anomalies(analysis_data)}
+    lines = []
+    for b in full:
+        own_return = b.get('ticker_own_return_pct', 0) or 0
+        direction = "rose" if own_return >= 0 else "fell"
+        mark = "  ← Sparmodus-Auswahl" if _anomaly_key(b) in active else ""
+        lines.append(f"- {b['date']}: {b['responsible_ticker']} {direction} "
+                     f"{own_return:+.2f}%{mark}")
+    header = (f"Ohne Sparmodus: {len(full)} Einzeltitel-Anomalien "
+             f"(aktuell aktiv: {len(active)}).\n\n")
+    return html.Pre(header + chr(10).join(lines), style=PROMPT_DEBUG_STYLE)
 
 
 def register(app):
@@ -695,6 +734,20 @@ def register(app):
         if is_open:
             return False, no_update  # Schließen: nicht neu berechnen
         return True, _naive_prompt_component(analysis_data)
+
+    @app.callback(
+        Output('collapse-naive-fullscope', 'is_open'),
+        Output('naive-fullscope-container', 'children'),
+        Input('btn-toggle-naive-fullscope', 'n_clicks'),
+        State('collapse-naive-fullscope', 'is_open'),
+        State('analysis-data', 'data'),
+        prevent_initial_call=True,
+    )
+    def toggle_naive_fullscope(n_clicks, is_open, analysis_data):
+        """Listet die Anomalien, die der Tab OHNE Sparmodus bearbeiten würde."""
+        if is_open:
+            return False, no_update
+        return True, _naive_fullscope_component(analysis_data)
 
     @app.callback(
         Output('collapse-compare-naive-prompt', 'is_open'),

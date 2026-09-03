@@ -10,25 +10,24 @@ Kullanim: python probe.py
 from dotenv import load_dotenv
 load_dotenv()
 
+from rag import config as rag_config
 from rag.pipeline import RAGPipeline
 from rag.evaluation import RETRIEVAL_QUERY, TOP_K
 
-# (tarih, ticker, gunluk getiri) — elle secilmis temsili ornekler
-PROBES = [
-    ("2024-01-25", "TSLA", -12.13),   # Q4-2023 sonuclari: 2024 buyume uyarisi
-    ("2021-01-27", "GME",  134.84),   # short squeeze zirvesi (haber kaynagi)
-    ("2024-04-24", "TSLA",  12.06),   # Q1-2024 sonuclari
-]
+# Bearbeitete Faelle: rag/config.py (PROBE_POOL/PROBE_PICK) — EINE Quelle fuer
+# Dashboard-Sparmodus, eval_probe.py und diese Datei. Auswahl aendern: dort
+# PROBE_PICK anpassen. Der Tagesgewinn spielt fuer das Retrieval keine Rolle
+# (nur Ticker + Zeitfenster zaehlen), wird also nicht mitgefuehrt.
+PROBES = [rag_config.PROBE_POOL[i - 1] for i in rag_config.PROBE_PICK]
 
 
 def main():
     p = RAGPipeline()
-    for date_str, ticker, ret in PROBES:
-        anomaly = {"date": date_str, "responsible_ticker": ticker,
-                   "ticker_own_return_pct": ret}
+    for date_str, ticker in PROBES:
+        anomaly = {"date": date_str, "responsible_ticker": ticker}
         chunks = p.retrieve_for_anomaly(RETRIEVAL_QUERY, anomaly, top_k=TOP_K)
         print("=" * 78)
-        print(f"{date_str}  {ticker}  {ret:+.2f}%   -> {len(chunks)} segment")
+        print(f"{date_str}  {ticker}   -> {len(chunks)} segment")
         print("=" * 78)
         for i, c in enumerate(chunks, 1):
             md = c.get("metadata", {})

@@ -12,10 +12,9 @@ from rag.config import DEFAULT_CONFIG
 from rag import config as rag_config  # Sparmodus-Schalter, als Attribut gelesen
 
 # Identischer Prompt-Builder UND identisches Modell wie im Naive-Tab — ein einziger
-# Ort (GENERATOR_MODEL) verhindert ein stilles Auseinanderlaufen der beiden Modelle
-# (siehe Vorfall: Groq hat llama-3.3-70b-versatile zwischenzeitlich entfernt).
-# make_llm_client/llm_api_key kapseln zudem den austauschbaren LLM-Anbieter
-# (Groq/OpenRouter, siehe callbacks/naive_llm.py::LLM_PROVIDER).
+# Ort (GENERATOR_MODEL) verhindert ein stilles Auseinanderlaufen der beiden Modelle.
+# make_llm_client/llm_api_key kapseln zudem die LLM-Anbindung (OpenRouter,
+# siehe callbacks/naive_llm.py).
 from callbacks.naive_llm import (build_portfolio_prompt, PROMPT_DEBUG_STYLE,
                                  GENERATOR_MODEL, GENERATION_MAX_TOKENS,
                                  llm_chat_with_retry, select_prompt_anomalies,
@@ -256,7 +255,11 @@ EVAL_METRIC_LABELS = {
     "answer_relevancy": "Answer Relevancy",
     "context_precision": "Context Precision",
     "context_recall": "Context Recall (Ground Truth)",
-    "source_support_naive": "Quellendeckung (Naive, gegen dieselbe Quellenbasis)",
+    # Dieselbe Metrik wie "faithfulness" (Faithfulness gegen dieselbe Quellenbasis),
+    # nur für die Naive-Antwort erhoben — Name betont den Vergleich, nicht eine
+    # andersartige Metrik (siehe rag/evaluation.py, naive_dataset).
+    "source_support_naive": "Faithfulness (Naive, gegen dieselbe Quellenbasis)",
+    "answer_relevancy_naive": "Answer Relevancy (Naive)",
 }
 
 
@@ -397,7 +400,10 @@ def _run_ragas_eval(rag_provider, analysis_data):
 
         agg = result["aggregate"]
         agg_text = " · ".join(
-            f"{EVAL_METRIC_LABELS[k]}: {_fmt_metric(v)}" for k, v in agg.items() if v is not None
+            # Fällt auf den Schlüsselnamen zurück: eine neu hinzugekommene Metrik
+            # ohne Beschriftung soll die Anzeige eines fertigen Laufs nicht verwerfen.
+            f"{EVAL_METRIC_LABELS.get(k, k)}: {_fmt_metric(v)}"
+            for k, v in agg.items() if v is not None
         ) or "Keine Metriken berechnet (keine auswertbare Anomalie mit abgerufenem Kontext)."
 
         return html.Div([
@@ -524,6 +530,38 @@ def register(app, rag_provider):
             return ""
         rag_pipeline = rag_provider.get()
         return _run_rag_analysis(rag_pipeline, analysis_data)
+
+    @app.callback(
+        Output('rag-reindex-status', 'children'),
+        Input('btn-rag-reindex', 'n_clicks'),
+        prevent_initial_call=True,
+    )
+    def reindex_from_cache(n_clicks):
+        """Segmentiert die gecachten Artikel mit dem AKTUELLEN Chunker neu.
+
+        Ohne diesen Schritt bleibt eine Änderung an rag/chunker.py wirkungslos: der
+        Index wächst nur um neue Artikel, die vorhandenen Chunks bleiben unberührt.
+        Läuft im Prozess der App — der Effekt ist ohne Neustart im nächsten
+        'Prompt anzeigen' sichtbar."""
+        rag_pipeline = rag_provider.get()
+        if not rag_pipeline:
+            return html.Span("RAG nicht verfügbar", className="text-danger")
+        try:
+            # Unter _rag_lock: der Neuaufbau leert den Index kurzzeitig
+            # (vectorstore.reset()). Ein gleichzeitiges Retrieval würde sonst auf
+            # einem halb gefüllten Index suchen und stillschweigend zu wenig finden.
+            with _rag_lock:
+                stats = rag_pipeline.reindex_from_cache()
+        except Exception as e:
+            logger.exception("Reindex fehlgeschlagen")
+            return html.Span(f"Fehler: {e}", className="text-danger")
+        scope = stats.get("scope")
+        note = (f" — Sparmodus: nur {', '.join(scope)}; vor einem vollen Lauf "
+                f"ohne Sparmodus erneut aufbauen" if scope else " — volles Portfolio")
+        return html.Span(
+            f"{stats['articles']} Artikel neu segmentiert: "
+            f"{stats['chunks_before']} → {stats['chunks_after']} Chunks{note}",
+            className="text-success")
 
     @app.callback(
         Output('collapse-rag-prompt', 'is_open'),

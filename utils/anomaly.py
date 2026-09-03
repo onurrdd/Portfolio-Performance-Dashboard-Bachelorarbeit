@@ -62,6 +62,9 @@ _CONCENTRATION_CUTOFF = 0.6  # Einzeltitel- vs. verteilt-Grenze
 # echter Ereignisse zu verlieren.
 _TICKER_MAD_Z_THRESHOLD = 2.5
 
+# 2.5 -> 26 çıktı - 5 -> 20 - 3 yapayım ->  
+
+
 
 def _rolling_mad(series, window, min_obs):
     # nanmedian statt median: pandas' min_periods garantiert genügend gültige Werte im

@@ -86,8 +86,29 @@ class AlphaVantageNewsSource:
                 "published": _parse_av_timestamp(item.get("time_published", "")),
                 "source": self.name,
                 "ticker": ticker,
+                # Ticker-spezifischer Bezug laut Alpha Vantage (0..1) — NICHT
+                # Sentiment. Kommt aus ticker_sentiment, nicht dem Artikel selbst:
+                # ein Ticker kann im Feed auftauchen, ohne dass der Artikel von
+                # diesem Unternehmen handelt (siehe rag/chunker.py::_mentions_company,
+                # dieselbe Lücke auf Textebene). Wird bisher nur mitgeführt, nicht
+                # gefiltert — Filterung ist ein möglicher nächster Schritt.
+                "relevance_score": _ticker_relevance(item, ticker),
             })
         return articles
+
+
+def _ticker_relevance(item: dict, ticker: str) -> Optional[float]:
+    """Liest den `relevance_score` des angefragten Tickers aus `ticker_sentiment`.
+
+    None, wenn der Ticker dort fehlt oder das Feld ungültig ist — kein 0,0, das
+    fälschlich als „irrelevant gemessen" statt „nicht gemessen" gelesen würde."""
+    for ts in item.get("ticker_sentiment", []):
+        if ts.get("ticker") == ticker:
+            try:
+                return float(ts.get("relevance_score"))
+            except (TypeError, ValueError):
+                return None
+    return None
 
 
 def _parse_av_timestamp(raw: str) -> str:

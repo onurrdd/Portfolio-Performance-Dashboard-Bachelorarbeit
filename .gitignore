@@ -36,3 +36,7 @@ data/ragas_eval_*.json
 
 # Persoenliche Arbeitsnotizen
 metindüzelt.txt
+
+# Yorumsuz okuma kopyaları
+ragas_yorumsuz/
+0109okumakicin_*.py

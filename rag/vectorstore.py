@@ -38,6 +38,17 @@ class FAISSVectorStore:
             self.index = faiss.read_index(self.index_path)
             with open(self.metadata_path, 'rb') as f:
                 self.metadata = pickle.load(f)
+            # Ein gespeicherter Index gehört zu dem Modell, mit dem er gefüllt wurde.
+            # Nach einem Modellwechsel passt seine Vektorlänge nicht mehr; er wird
+            # verworfen statt weiterverwendet, sonst schlüge erst das spätere
+            # Einfügen oder Suchen mit einer Dimensionsprüfung fehl.
+            if self.index.d != embedding_dim:
+                logger.warning(
+                    f"Index in {self.index_path} hat Dimension {self.index.d}, "
+                    f"das Modell liefert {embedding_dim} — Index wird verworfen. "
+                    f"Neu aufbauen (Schaltfläche 'Index neu aufbauen').")
+                self.index = faiss.IndexFlatL2(embedding_dim)
+                self.metadata = []
         else:
             logger.info(f"Creating new FAISS index with dimension {embedding_dim}")
             self.index = faiss.IndexFlatL2(embedding_dim)  # L2 distance
@@ -152,11 +163,18 @@ class FAISSVectorStore:
         logger.info(f"Index saved to {self.index_path}")
 
     def reset(self) -> None:
-        """Reset the index."""
-        self.index.reset()
+        """Leert den Index — und legt ihn mit der AKTUELLEN Vektorlänge neu an.
+
+        `IndexFlatL2.reset()` entfernt nur die Vektoren; die Dimension bleibt die
+        des einmal geladenen Index. Nach einem Wechsel des Einbettungsmodells
+        (384 → 768) scheiterte das anschließende Einfügen deshalb an einer
+        Dimensionsprüfung tief in FAISS, obwohl der Aufrufer den Index gerade
+        vollständig neu aufbaut. Ein frisches Indexobjekt macht den Neuaufbau
+        unabhängig davon, womit der alte Index gefüllt worden war."""
+        self.index = faiss.IndexFlatL2(self.embedding_dim)
         self.metadata = []
         self._save()
-        logger.info("Index reset")
+        logger.info(f"Index reset (dim={self.embedding_dim})")
 
 
 def create_vectorstore(persist_dir: str = "./data/faiss", embedding_dim: int = 384) -> FAISSVectorStore:

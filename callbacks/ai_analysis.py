@@ -1,7 +1,9 @@
 import os
-from groq import Groq
+from openai import OpenAI
 import dash_bootstrap_components as dbc
 from dash import Input, Output, State, html
+
+_OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 
 
 def register(app):
@@ -18,7 +20,8 @@ def register(app):
             return dbc.Alert("Keine Portfolio-Daten verfügbar. Bitte füge zuerst Positionen hinzu.", color="warning")
 
         try:
-            client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
+            client = OpenAI(base_url=_OPENROUTER_BASE_URL,
+                            api_key=os.environ.get("OPENROUTER_API_KEY"))
             metrics = analysis_data.get('metrics', {})
             allocation = analysis_data.get('allocation', [])
             rolling_sharpe = analysis_data.get('rolling_sharpe', {})
@@ -75,7 +78,7 @@ Bitte bewerte diese Metriken kurz und prägnant:
                         'color': '#f0f6fc'
                     }),
                     html.Hr(),
-                    html.Small("Erstellt mit Groq", className="text-muted")
+                    html.Small("Erstellt mit OpenRouter", className="text-muted")
                 ])
             ], className="card-custom mt-3")
 
@@ -85,7 +88,7 @@ Bitte bewerte diese Metriken kurz und prägnant:
                 html.P(f"Fehlerdetails: {str(e)}"),
                 html.Hr(),
                 html.Small(["Mögliche Ursachen:", html.Ul([
-                    html.Li("GROQ_API_KEY nicht gesetzt"),
+                    html.Li("OPENROUTER_API_KEY nicht gesetzt"),
                     html.Li("Ungültiger API-Schlüssel"),
                     html.Li("Netzwerkprobleme"),
                     html.Li("API-Rate-Limit erreicht")
