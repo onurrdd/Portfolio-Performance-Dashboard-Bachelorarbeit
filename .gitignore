@@ -26,6 +26,8 @@ data/news_cache.db
 data/price_cache.db
 data/_backup_before_rebuild/
 data/ragas_eval_*.json
+# Ausnahme: der in Kapitel 6.3 ausgewertete finale Evaluationslauf
+!data/ragas_eval_20260831_031814.json
 
 # Claude Code interne Einstellungen
 .claude/
@@ -33,6 +35,8 @@ data/ragas_eval_*.json
 # Bachelorarbeit-Arbeitsnotizen und Thesistexte (nicht Teil des Codes)
 # ALLE Markdown-Dateien werden ignoriert, ohne Ausnahme (auch CLAUDE.md).
 *.md
+# Ausnahme: README fuer die Gutachter
+!README.md
 
 # Persoenliche Arbeitsnotizen
 metindüzelt.txt
